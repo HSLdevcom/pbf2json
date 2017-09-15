@@ -96,9 +96,6 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
                 // write to leveldb
                 // ----------------
 
-                // write immediately
-                // cacheStore(db, v)
-
                 // write in batches
                 cacheQueue(batch, v)
                 if batch.Len() > config.BatchSize {
@@ -109,12 +106,7 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
                 // handle tags
                 // ----------------
 
-                if !hasTags(v.Tags) {
-                    break
-                }
-
-                v.Tags = trimTags(v.Tags)
-                if containsValidTags(v.Tags, config.Tags) {
+                if v.Tags = containsValidTags(v.Tags, config.Tags); v.Tags != nil {
                     onNode(v)
                 }
 
@@ -129,16 +121,10 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
                     cacheFlush(db, batch)
                 }
 
-                // inc count
                 wc++
 
-                if !hasTags(v.Tags) {
-                    break
-                }
+                if v.Tags = containsValidTags(v.Tags, config.Tags); v.Tags != nil {
 
-                v.Tags = trimTags(v.Tags)
-
-                if containsValidTags(v.Tags, config.Tags) {
                     // special treatment for buildings
                     _, isBuilding := v.Tags["building"]
 
@@ -166,10 +152,8 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
 
                 // inc count
                 rc++
-                if !hasTags(v.Tags) { break }
 
-                v.Tags = trimTags(v.Tags)
-                if containsValidTags( v.Tags, config.Tags ) {
+                if v.Tags = containsValidTags(v.Tags, config.Tags); v.Tags != nil {
                    onRelation(v)
                 }
 
@@ -387,13 +371,17 @@ func matchTagsAgainstCompulsoryTagList(tags map[string]string, tagList []string)
 }
 
 // check tags contain features from a groups of whitelists
-func containsValidTags(tags map[string]string, group map[string][]string) bool {
-    for _, list := range group {
-        if matchTagsAgainstCompulsoryTagList(tags, list) {
-            return true
+func containsValidTags(tags map[string]string, group map[string][]string) map[string]string {
+     if hasTags(tags) {
+        tags = trimTags(tags)
+
+        for _, list := range group {
+            if matchTagsAgainstCompulsoryTagList(tags, list) {
+               return tags
+            }
         }
     }
-    return false
+    return nil
 }
 
 
