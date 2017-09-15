@@ -97,7 +97,8 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
                 // ----------------
 
                 // write in batches
-                cacheQueue(batch, v)
+                id, data := formatLevelDBNode(v)
+                cacheQueue(batch, id, data)
                 if batch.Len() > config.BatchSize {
                     cacheFlush(db, batch)
                 }
@@ -111,10 +112,6 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
                 }
 
             case *osmpbf.Way:
-
-                // ----------------
-                // write to leveldb
-                // ----------------
 
                 // flush outstanding batches
                 if batch.Len() > 1 {
@@ -149,6 +146,10 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
                 }
 
             case *osmpbf.Relation:
+
+                if batch.Len() > 1 {
+                    cacheFlush(db, batch)
+                }
 
                 // inc count
                 rc++
@@ -210,8 +211,7 @@ func onRelation(rel *osmpbf.Relation){
 }
 
 // write to leveldb immediately
-func cacheStore(db *leveldb.DB, node *osmpbf.Node) {
-    id, val := formatLevelDB(node)
+func cacheStore(db *leveldb.DB, id string, val []byte) {
     err := db.Put([]byte(id), []byte(val), nil)
     if err != nil {
         log.Fatal(err)
@@ -219,8 +219,7 @@ func cacheStore(db *leveldb.DB, node *osmpbf.Node) {
 }
 
 // queue a leveldb write in a batch
-func cacheQueue(batch *leveldb.Batch, node *osmpbf.Node) {
-    id, val := formatLevelDB(node)
+func cacheQueue(batch *leveldb.Batch, id string, val []byte) {
     batch.Put([]byte(id), []byte(val))
 }
 
@@ -305,7 +304,7 @@ func cacheFetch(db *leveldb.DB, ID int64) *jsonNode {
 }
 
 
-func formatLevelDB(node *osmpbf.Node) (id string, val []byte) {
+func formatLevelDBNode(node *osmpbf.Node) (id string, val []byte) {
 
     stringid := strconv.FormatInt(node.ID, 10)
     var bufval bytes.Buffer
