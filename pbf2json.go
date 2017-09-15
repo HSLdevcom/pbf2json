@@ -38,11 +38,11 @@ type jsonWay struct {
     Nodes    []map[string]string `json:"nodes"`
 }
 
-type JsonRelation struct {
+type jsonRelation struct {
     ID        int64               `json:"id"`
     Type      string              `json:"type"`
     Tags      map[string]string   `json:"tags"`
-    Members   []osmpbf.Member     `json:"members"`
+    Centroid  map[string]string   `json:"centroid"`
 }
 
 
@@ -72,7 +72,7 @@ func getSettings() settings {
     }
 
     // fmt.Print(conditions, len(conditions))
-    // os.Exit(1)
+    // os.exit(1)
 
     return settings{args[0], *leveldbPath, conditions, *batchSize}
 }
@@ -167,9 +167,9 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
                 }
                 rc++
 
-                v.Tags = trimTags(v.Tags)
-                if containsValidTags(v.Tags, config.Tags) {
-                   onRelation(v)
+                _, _, jRel := formatRelation(v, db)
+                if containsValidTags(jRel.Tags, config.Tags) {
+                   printJson(jRel)
                 }
 
             default:
@@ -187,11 +187,6 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
 func printJson(v interface{}) {
     json, _ := json.Marshal(v)
     fmt.Println(string(json))
-}
-
-func onRelation(rel *osmpbf.Relation){
-    marshall := JsonRelation{ rel.ID, "relation", rel.Tags, rel.Members }
-    printJson(marshall)
 }
 
 // write to leveldb immediately
@@ -221,9 +216,9 @@ func cacheLookup(db *leveldb.DB, way *osmpbf.Way) ([]map[string]string) {
     var container []map[string]string
 
     for _, each := range way.NodeIDs {
-        node := cacheFetch(db, each)
+        node, _ := cacheFetch(db, each).(*jsonNode)
         if node == nil {
-           log.Println("denormalize failed for way:", way.ID, "node not found:", each)
+           // log.Println("denormalize failed for way:", way.ID, "node not found:", each)
            return nil
         }
         latlon := nodeLatLon(node);
@@ -233,19 +228,19 @@ func cacheLookup(db *leveldb.DB, way *osmpbf.Way) ([]map[string]string) {
     return container
 }
 
-func entranceLookup(db *leveldb.DB, way *osmpbf.Way) map[string]string {
+func entranceLookup(db *leveldb.DB, way *osmpbf.Way) (location map[string]string, foundMain bool) {
 
      var latlon map[string]string
 
      for _, each := range way.NodeIDs {
-        node := cacheFetch(db, each)
+        node, _ := cacheFetch(db, each).(*jsonNode)
 
-        if node == nil {
-           return nil
+        if node == nil { // bad reference, skip
+           return nil, false
         }
         if val, ok := node.Tags["entrance"]; ok {
            if val == "main" {
-              return nodeLatLon(node); // use first detected main entrance
+              return nodeLatLon(node), true; // use first detected main entrance
            }
            if val == "yes" {
               latlon = nodeLatLon(node);
@@ -254,10 +249,10 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way) map[string]string {
         }
     }
 
-    return latlon;
+    return latlon, false;
 }
 
-func cacheFetch(db *leveldb.DB, ID int64) *jsonNode {
+func cacheFetch(db *leveldb.DB, ID int64) interface{} {
 
     stringid := strconv.FormatInt(ID, 10)
 
@@ -271,17 +266,17 @@ func cacheFetch(db *leveldb.DB, ID int64) *jsonNode {
        return nil
     }
 
-    nodetype, ok := obj["type"].(string)
-
-    if ok && nodetype == "node" {
-       tags := make(map[string]string)
-       _tags, ok := obj["tags"].(map[string]interface{});
-       if ok {
-          for k, v := range _tags {
-              tags[k], _  = v.(string)
-          }
-       }
-       return &jsonNode{ID, "node", obj["lat"].(float64), obj["lon"].(float64), tags}
+    // now when the type is known, unmarshal again to avoid manual casting
+    nodetype, _ := obj["type"].(string)
+    if nodetype == "node" {
+       jNode := jsonNode{}
+       json.Unmarshal(data, &jNode)
+       return &jNode
+    }
+    if nodetype == "way" {
+       jWay := jsonWay{}
+       json.Unmarshal(data, &jWay)
+       return &jWay
     }
 
     return nil
@@ -319,7 +314,7 @@ func formatWay(way *osmpbf.Way, db *leveldb.DB) (id string, val []byte, jway *js
     }
     var centroid map[string]string
     if isBuilding {
-       centroid = entranceLookup(db, way)
+       centroid, _ = entranceLookup(db, way)
     }
 
     if centroid == nil {
@@ -332,6 +327,38 @@ func formatWay(way *osmpbf.Way, db *leveldb.DB) (id string, val []byte, jway *js
     byteval := []byte(bufval.String())
 
     return stringid, byteval, &jWay
+}
+
+func formatRelation(relation *osmpbf.Relation, db *leveldb.DB) (id string, val []byte, rel *jsonRelation) {
+
+    stringid := strconv.FormatInt(relation.ID, 10)
+    var bufval bytes.Buffer
+
+    var latlons []map[string]string
+
+    for _, each := range relation.Members {
+        way := cacheFetch(db, each.ID).(*jsonWay)
+        if way == nil {
+           log.Println("denormalize failed for relation:", relation.ID, "node not found:", each.ID)
+           return stringid, nil, nil
+        }
+        latlons = append(latlons, way.Centroid)
+    }
+
+    if len(latlons) == 0 {
+        log.Println("Skipping relation without location: ", relation.ID)
+        return stringid, nil, nil
+    }
+
+    centroid := computeCentroid(latlons)
+
+    jRelation := jsonRelation{relation.ID, "relation", trimTags(relation.Tags), centroid}
+    json, _ := json.Marshal(jRelation)
+
+    bufval.WriteString(string(json))
+    byteval := []byte(bufval.String())
+
+    return stringid, byteval, &jRelation
 }
 
 func openFile(filename string) *os.File {
