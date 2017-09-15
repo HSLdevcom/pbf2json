@@ -166,8 +166,12 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
 
                 // inc count
                 rc++
+                if !hasTags(v.Tags) { break }
 
-                onRelation(v)
+                v.Tags = trimTags(v.Tags)
+                if containsValidTags( v.Tags, config.Tags ) {
+                   onRelation(v)
+                }
 
             default:
 
@@ -208,8 +212,17 @@ func onWay(way *osmpbf.Way, latlons []map[string]string, centroid map[string]str
     fmt.Println(string(json))
 }
 
-func onRelation(relation *osmpbf.Relation) {
-    // do nothing (yet)
+type JsonRelation struct {
+    ID        int64               `json:"id"`
+    Type      string              `json:"type"`
+    Tags      map[string]string   `json:"tags"`
+    Members   []osmpbf.Member     `json:"members"`
+}
+
+func onRelation(rel *osmpbf.Relation){
+    marshall := JsonRelation{ rel.ID, "relation", rel.Tags, rel.Members }
+    json, _ := json.Marshal(marshall)
+    fmt.Println(string(json))
 }
 
 // write to leveldb immediately
