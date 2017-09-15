@@ -22,6 +22,30 @@ type settings struct {
     BatchSize  int
 }
 
+type jsonNode struct {
+    ID   int64             `json:"id"`
+    Type string            `json:"type"`
+    Lat  float64           `json:"lat"`
+    Lon  float64           `json:"lon"`
+    Tags map[string]string `json:"tags"`
+}
+
+type jsonWay struct {
+    ID   int64             `json:"id"`
+    Type string            `json:"type"`
+    Tags map[string]string `json:"tags"`
+    Centroid map[string]string   `json:"centroid"`
+    Nodes    []map[string]string `json:"nodes"`
+}
+
+type JsonRelation struct {
+    ID        int64               `json:"id"`
+    Type      string              `json:"type"`
+    Tags      map[string]string   `json:"tags"`
+    Members   []osmpbf.Member     `json:"members"`
+}
+
+
 func getSettings() settings {
 
     // command line flags
@@ -79,12 +103,18 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
     batch := new(leveldb.Batch)
 
     var nc, wc, rc uint64
+
+    // NOTE: this logic expects that parser outputs all nodes
+    // before ways and all ways before relations
+    prevtype := "node"
+
     for {
         if v, err := d.Decode(); err == io.EOF {
             break
         } else if err != nil {
             log.Fatal(err)
         } else {
+
             switch v := v.(type) {
 
             case *osmpbf.Node:
@@ -97,52 +127,37 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
                 // ----------------
 
                 // write in batches
-                id, data := formatLevelDBNode(v)
+                id, data, jNode := formatNode(v)
                 cacheQueue(batch, id, data)
                 if batch.Len() > config.BatchSize {
                     cacheFlush(db, batch)
                 }
 
-                // ----------------
-                // handle tags
-                // ----------------
-
-                if v.Tags = containsValidTags(v.Tags, config.Tags); v.Tags != nil {
-                    onNode(v)
+                if containsValidTags(jNode.Tags, config.Tags) {
+                    printJson(jNode)
                 }
 
             case *osmpbf.Way:
 
-                // flush outstanding batches
-                if batch.Len() > 1 {
-                    cacheFlush(db, batch)
+                if prevtype != "way" {
+                   prevtype = "way"
+                   if batch.Len() > 1 {
+                      // flush outstanding node batches
+                      cacheFlush(db, batch)
+                   }
                 }
-
                 wc++
 
-                if v.Tags = containsValidTags(v.Tags, config.Tags); v.Tags != nil {
-
-                    // special treatment for buildings
-                    _, isBuilding := v.Tags["building"]
-
-                    // lookup from leveldb
-                    latlons := cacheLookup(db, v)
-
-                    // skip ways which fail to denormalize
-                    if latlons == nil {
-                       break
+                id, data, jWay := formatWay(v, db)
+                if data != nil { // valid entry
+                    cacheQueue(batch, id, data)
+                    if batch.Len() > config.BatchSize {
+                       cacheFlush(db, batch)
                     }
 
-                    var centroid map[string]string
-
-                    if isBuilding {
-                       centroid = entranceLookup(db, v)
+                    if containsValidTags(jWay.Tags, config.Tags) {
+                       printJson(jWay)
                     }
-
-                    if centroid == nil {
-                        centroid = computeCentroid(latlons)
-                    }
-                    onWay(v, latlons, centroid)
                 }
 
             case *osmpbf.Relation:
@@ -150,11 +165,10 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
                 if batch.Len() > 1 {
                     cacheFlush(db, batch)
                 }
-
-                // inc count
                 rc++
 
-                if v.Tags = containsValidTags(v.Tags, config.Tags); v.Tags != nil {
+                v.Tags = trimTags(v.Tags)
+                if containsValidTags(v.Tags, config.Tags) {
                    onRelation(v)
                 }
 
@@ -169,45 +183,15 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
     // fmt.Printf("Nodes: %d, Ways: %d, Relations: %d\n", nc, wc, rc)
 }
 
-type jsonNode struct {
-    ID   int64             `json:"id"`
-    Type string            `json:"type"`
-    Lat  float64           `json:"lat"`
-    Lon  float64           `json:"lon"`
-    Tags map[string]string `json:"tags"`
-}
 
-func onNode(node *osmpbf.Node) {
-    marshall := jsonNode{node.ID, "node", node.Lat, node.Lon, node.Tags}
-    json, _ := json.Marshal(marshall)
+func printJson(v interface{}) {
+    json, _ := json.Marshal(v)
     fmt.Println(string(json))
-}
-
-type jsonWay struct {
-    ID   int64             `json:"id"`
-    Type string            `json:"type"`
-    Tags map[string]string `json:"tags"`
-    Centroid map[string]string   `json:"centroid"`
-    Nodes    []map[string]string `json:"nodes"`
-}
-
-func onWay(way *osmpbf.Way, latlons []map[string]string, centroid map[string]string) {
-    marshall := jsonWay{way.ID, "way", way.Tags, centroid, latlons}
-    json, _ := json.Marshal(marshall)
-    fmt.Println(string(json))
-}
-
-type JsonRelation struct {
-    ID        int64               `json:"id"`
-    Type      string              `json:"type"`
-    Tags      map[string]string   `json:"tags"`
-    Members   []osmpbf.Member     `json:"members"`
 }
 
 func onRelation(rel *osmpbf.Relation){
     marshall := JsonRelation{ rel.ID, "relation", rel.Tags, rel.Members }
-    json, _ := json.Marshal(marshall)
-    fmt.Println(string(json))
+    printJson(marshall)
 }
 
 // write to leveldb immediately
@@ -304,18 +288,50 @@ func cacheFetch(db *leveldb.DB, ID int64) *jsonNode {
 }
 
 
-func formatLevelDBNode(node *osmpbf.Node) (id string, val []byte) {
+func formatNode(node *osmpbf.Node) (id string, val []byte, jnode *jsonNode) {
 
     stringid := strconv.FormatInt(node.ID, 10)
     var bufval bytes.Buffer
 
-    marshall := jsonNode{node.ID, "node", node.Lat, node.Lon, node.Tags}
-    json, _ := json.Marshal(marshall)
+    jNode := jsonNode{node.ID, "node", node.Lat, node.Lon, trimTags(node.Tags)}
+    json, _ := json.Marshal(jNode)
 
     bufval.WriteString(string(json))
     byteval := []byte(bufval.String())
 
-    return stringid, byteval
+    return stringid, byteval, &jNode
+}
+
+func formatWay(way *osmpbf.Way, db *leveldb.DB) (id string, val []byte, jway *jsonWay) {
+
+    stringid := strconv.FormatInt(way.ID, 10)
+    var bufval bytes.Buffer
+
+    // special treatment for buildings
+    _, isBuilding := way.Tags["building"]
+
+    // lookup from leveldb
+    latlons := cacheLookup(db, way)
+
+    // skip ways which fail to denormalize
+    if latlons == nil {
+       return stringid, nil, nil
+    }
+    var centroid map[string]string
+    if isBuilding {
+       centroid = entranceLookup(db, way)
+    }
+
+    if centroid == nil {
+       centroid = computeCentroid(latlons)
+    }
+    jWay := jsonWay{way.ID, "way", trimTags(way.Tags), centroid, latlons}
+    json, _ := json.Marshal(jWay)
+
+    bufval.WriteString(string(json))
+    byteval := []byte(bufval.String())
+
+    return stringid, byteval, &jWay
 }
 
 func openFile(filename string) *os.File {
@@ -370,17 +386,15 @@ func matchTagsAgainstCompulsoryTagList(tags map[string]string, tagList []string)
 }
 
 // check tags contain features from a groups of whitelists
-func containsValidTags(tags map[string]string, group map[string][]string) map[string]string {
+func containsValidTags(tags map[string]string, group map[string][]string) bool {
      if hasTags(tags) {
-        tags = trimTags(tags)
-
         for _, list := range group {
             if matchTagsAgainstCompulsoryTagList(tags, list) {
-               return tags
+               return true
             }
         }
     }
-    return nil
+    return false
 }
 
 
