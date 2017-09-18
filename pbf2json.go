@@ -230,28 +230,28 @@ func cacheLookup(db *leveldb.DB, way *osmpbf.Way) ([]map[string]string) {
     return container
 }
 
-func entranceLookup(db *leveldb.DB, way *osmpbf.Way) (location map[string]string, foundMain bool) {
-
+func entranceLookup(db *leveldb.DB, way *osmpbf.Way) (location map[string]string, entranceType string) {
      var latlon map[string]string
+     eType := ""
 
      for _, each := range way.NodeIDs {
         node, _ := cacheFetch(db, each).(*jsonNode)
-
-        if node == nil { // bad reference, skip
-           return nil, false
+        if node == nil {
+           return nil, eType // bad reference, skip
         }
-        if val, ok := node.Tags["entrance"]; ok {
-           if val == "main" {
-              return nodeLatLon(node), true; // use first detected main entrance
-           }
-           if val == "yes" {
-              latlon = nodeLatLon(node);
-              // store found entrance but keep on looking for a main entrance
-           }
+
+        val, _type := entranceLatLon(node)
+
+        if _type == "mainEntrance" {
+            return val, _type // use first detected main entrance
+        }
+        if _type == "entrance" {
+           latlon = val
+           eType = _type
+           // store found entrance but keep on looking for a main entrance
         }
     }
-
-    return latlon, false;
+    return latlon, eType;
 }
 
 func cacheFetch(db *leveldb.DB, ID int64) interface{} {
@@ -312,16 +312,19 @@ func formatWay(way *osmpbf.Way, db *leveldb.DB) (id string, val []byte, jway *js
 
     // skip ways which fail to denormalize
     if latlons == nil {
-       return stringid, nil, nil
+        return stringid, nil, nil
     }
     var centroid map[string]string
+    var centroidType string
     if isBuilding {
-       centroid, _ = entranceLookup(db, way)
+        centroid, centroidType = entranceLookup(db, way)
     }
 
-    if centroid == nil {
-       centroid = computeCentroid(latlons)
+    if centroidType == "" {
+        centroid = computeCentroid(latlons)
+        centroidType = "average"
     }
+    way.Tags["_centroidType"] = centroidType;
     jWay := jsonWay{way.ID, "way", trimTags(way.Tags), centroid, latlons}
     json, _ := json.Marshal(jWay)
 
@@ -337,29 +340,49 @@ func formatRelation(relation *osmpbf.Relation, db *leveldb.DB) (id string, val [
     var bufval bytes.Buffer
 
     var latlons []map[string]string
+    var centroid map[string]string
 
+    var entranceFound bool
     for _, each := range relation.Members {
         entity := cacheFetch(db, each.ID);
         way, ok := entity.(*jsonWay)
         if ok {
-            latlons = append(latlons, way.Centroid)
+            if cType, ok := way.Tags["_centroidType"]; ok {
+                entranceFound = true
+                centroid = way.Centroid
+                if cType == "mainEntrance" {
+                    break // use first detected main entrance
+                }
+            } else {
+                latlons = append(latlons, way.Centroid)
+            }
         } else {
             node, ok2 := entity.(*jsonNode)
             if ok2 {
-               latlons = append(latlons, nodeLatLon(node))
+
+                if val, _type := entranceLatLon(node); _type != "" {
+                    entranceFound = true
+                    centroid = val
+                    if _type == "mainEntrance" {
+                        break
+                    }
+                } else {
+                    latlons = append(latlons, nodeLatLon(node))
+                }
             } else {
-              log.Println("denormalize failed for relation:", relation.ID, "member not found:", each.ID)
-              return stringid, nil, nil
+                // log.Println("denormalize failed for relation:", relation.ID, "member not found:", each.ID)
+                return stringid, nil, nil
             }
         }
     }
 
-    if len(latlons) == 0 {
-        log.Println("Skipping relation without location: ", relation.ID)
-        return stringid, nil, nil
+    if !entranceFound {
+        if len(latlons) == 0 {
+           log.Println("Skipping relation without location: ", relation.ID)
+           return stringid, nil, nil
+        }
+        centroid = computeCentroid(latlons)
     }
-
-    centroid := computeCentroid(latlons)
 
     jRelation := jsonRelation{relation.ID, "relation", trimTags(relation.Tags), centroid}
     json, _ := json.Marshal(jRelation)
@@ -484,6 +507,19 @@ func computeCentroid(latlons []map[string]string) map[string]string {
     centroid["lon"] = strconv.FormatFloat(compute.Lng(), 'f', 6, 64)
 
     return centroid
+}
+
+func entranceLatLon(node *jsonNode) (latlon map[string]string, entranceType string) {
+
+    if val, ok := node.Tags["entrance"]; ok {
+        if val == "main" {
+            return nodeLatLon(node), "mainEntrance"
+        }
+        if val == "yes" {
+           return nodeLatLon(node), "entrance"
+        }
+    }
+    return nil, ""
 }
 
 func nodeLatLon(node *jsonNode) map[string]string {
