@@ -35,7 +35,7 @@ type jsonWay struct {
     Type string            `json:"type"`
     Tags map[string]string `json:"tags"`
     Centroid map[string]float64 `json:"centroid"`
-    Nodes []map[string]float64  `json:"nodes"`
+    Points []map[string]float64  `json:"nodes"`
 }
 
 type jsonRelation struct {
