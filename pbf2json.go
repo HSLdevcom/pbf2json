@@ -85,6 +85,8 @@ func main() {
     // configuration
     config := getSettings()
 
+    refmap := make(map[int64]bool)
+
     // open pbf file
     file := openFile(config.PbfPath)
     defer file.Close()
@@ -94,18 +96,60 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
+    collectRefs(decoder, refmap, config)
 
+    fmt.Println(" ####### refs collected ######");
+    file.Seek(0,0)
+
+    decoder = osmpbf.NewDecoder(file)
+    err = decoder.Start(runtime.GOMAXPROCS(-1))
+    if err != nil {
+        log.Fatal(err)
+    }
     db := openLevelDB(config.LevedbPath)
     defer db.Close()
 
-    run(decoder, db, config)
+    run(decoder, db, config, refmap)
 }
 
-func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
+
+func collectRefs(d *osmpbf.Decoder, refmap map[int64]bool, config settings) {
+    for {
+        if v, err := d.Decode(); err == io.EOF {
+            break
+        } else if err != nil {
+            log.Fatal(err)
+        } else {
+
+            switch v := v.(type) {
+
+            case *osmpbf.Way:
+                if _, ok := containsValidTags(v.Tags, config.Tags); ok {
+                    for _, each := range v.NodeIDs {
+                        refmap[each] = true
+                    }
+                }
+
+            case *osmpbf.Relation:
+                if _, ok := containsValidTags(trimTags(v.Tags), config.Tags); ok {
+                    for _, each := range v.Members {
+                        refmap[each.ID] = true
+                    }
+                }
+
+            default:
+                // nop
+            }
+        }
+    }
+}
+
+func run(d *osmpbf.Decoder, db *leveldb.DB, config settings, refmap map[int64]bool) {
 
     batch := new(leveldb.Batch)
 
     var nc, wc, rc uint64
+    var valid bool
 
     // NOTE: this logic expects that parser outputs all nodes
     // before ways and all ways before relations
@@ -121,23 +165,17 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
             switch v := v.(type) {
 
             case *osmpbf.Node:
-
-                // inc count
                 nc++
-
-                // ----------------
-                // write to leveldb
-                // ----------------
-
-                // write in batches
-                id, data, jNode := formatNode(v)
-                cacheQueue(batch, id, data)
-                if batch.Len() > config.BatchSize {
-                    cacheFlush(db, batch)
-                }
-
-                if containsValidTags(jNode.Tags, config.Tags) {
-                    printJson(jNode)
+                v.Tags, valid = containsValidTags(v.Tags, config.Tags)
+                if valid || refmap[v.ID] {
+                   id, data, jNode := formatNode(v)
+                   cacheQueue(batch, id, data)
+                   if batch.Len() > config.BatchSize {
+                       cacheFlush(db, batch)
+                   }
+                   if valid {
+                       printJson(jNode)
+                   }
                 }
 
             case *osmpbf.Way:
@@ -151,15 +189,17 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
                 }
                 wc++
 
-                id, data, jWay := formatWay(v, db)
-                if data != nil { // valid entry
-                    cacheQueue(batch, id, data)
-                    if batch.Len() > config.BatchSize {
-                       cacheFlush(db, batch)
-                    }
-
-                    if containsValidTags(jWay.Tags, config.Tags) {
-                       printJson(jWay)
+                v.Tags, valid = containsValidTags(v.Tags, config.Tags)
+                if valid || refmap[v.ID] {
+                    id, data, jWay := formatWay(v, db)
+                    if data != nil { // valid entry
+                        cacheQueue(batch, id, data)
+                        if batch.Len() > config.BatchSize {
+                            cacheFlush(db, batch)
+                        }
+                        if valid {
+                            printJson(jWay)
+                        }
                     }
                 }
 
@@ -170,7 +210,7 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
                 }
                 rc++
 
-                if containsValidTags(v.Tags, config.Tags) {
+                if v.Tags, valid = containsValidTags(v.Tags, config.Tags); valid {
                    _, _, jRel := formatRelation(v, db)
                    if jRel != nil {
                       printJson(jRel)
@@ -292,7 +332,7 @@ func formatNode(node *osmpbf.Node) (id string, val []byte, jnode *jsonNode) {
     stringid := strconv.FormatInt(node.ID, 10)
     var bufval bytes.Buffer
 
-    jNode := jsonNode{node.ID, "node", node.Lat, node.Lon, trimTags(node.Tags)}
+    jNode := jsonNode{node.ID, "node", node.Lat, node.Lon, node.Tags}
     json, _ := json.Marshal(jNode)
 
     bufval.WriteString(string(json))
@@ -327,7 +367,7 @@ func formatWay(way *osmpbf.Way, db *leveldb.DB) (id string, val []byte, jway *js
         centroidType = "average"
     }
     way.Tags["_centroidType"] = centroidType;
-    jWay := jsonWay{way.ID, "way", trimTags(way.Tags), centroid, points}
+    jWay := jsonWay{way.ID, "way", way.Tags, centroid, points}
     json, _ := json.Marshal(jWay)
 
     bufval.WriteString(string(json))
@@ -386,7 +426,7 @@ func formatRelation(relation *osmpbf.Relation, db *leveldb.DB) (id string, val [
         centroid = computeCentroid(points)
     }
 
-    jRelation := jsonRelation{relation.ID, "relation", trimTags(relation.Tags), centroid}
+    jRelation := jsonRelation{relation.ID, "relation", relation.Tags, centroid}
     json, _ := json.Marshal(jRelation)
 
     bufval.WriteString(string(json))
@@ -398,7 +438,7 @@ func formatRelation(relation *osmpbf.Relation, db *leveldb.DB) (id string, val [
 func openFile(filename string) *os.File {
     // no file specified
     if len(filename) < 1 {
-        log.Fatal("invalid file: you must specify a pbf path as arg[1]")
+        log.Fatal("invalidfile: you must specify a pbf path as arg[1]")
     }
     // try to open the file
     file, err := os.Open(filename)
@@ -447,15 +487,16 @@ func matchTagsAgainstCompulsoryTagList(tags map[string]string, tagList []string)
 }
 
 // check tags contain features from a groups of whitelists
-func containsValidTags(tags map[string]string, group map[string][]string) bool {
-     if hasTags(tags) {
+func containsValidTags(tags map[string]string, group map[string][]string) (map[string]string,  bool) {
+    if hasTags(tags) {
+        tags = trimTags(tags)
         for _, list := range group {
             if matchTagsAgainstCompulsoryTagList(tags, list) {
-               return true
+               return tags, true
             }
         }
     }
-    return false
+    return tags, false
 }
 
 
