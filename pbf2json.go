@@ -7,6 +7,7 @@ import "bytes"
 import "os"
 import "log"
 import "io"
+import "path/filepath"
 
 import "runtime"
 import "strings"
@@ -56,6 +57,7 @@ func getSettings() settings {
 
     // command line flags
     leveldbPath := flag.String("leveldb", "/tmp", "path to leveldb directory")
+
     tagList := flag.String("tags", "", "comma-separated list of valid tags, group AND conditions with a +")
     batchSize := flag.Int("batch", 50000, "batch leveldb writes in batches of this size")
 
@@ -85,6 +87,9 @@ func main() {
     // configuration
     config := getSettings()
 
+    config.LevedbPath = filepath.Join(config.LevedbPath, "leveldb")
+    os.MkdirAll(config.LevedbPath, os.ModePerm)
+
     refmap := make(map[int64]bool)
 
     // open pbf file
@@ -110,6 +115,9 @@ func main() {
     defer db.Close()
 
     run(decoder, db, config, refmap)
+
+    db.Close()
+    os.RemoveAll(config.LevedbPath)
 }
 
 
