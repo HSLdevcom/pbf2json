@@ -167,9 +167,11 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings) {
                 }
                 rc++
 
-                _, _, jRel := formatRelation(v, db)
-                if containsValidTags(jRel.Tags, config.Tags) {
-                   printJson(jRel)
+                if containsValidTags(v.Tags, config.Tags) {
+                   _, _, jRel := formatRelation(v, db)
+                   if jRel != nil {
+                      printJson(jRel)
+                   }
                 }
 
             default:
@@ -337,12 +339,19 @@ func formatRelation(relation *osmpbf.Relation, db *leveldb.DB) (id string, val [
     var latlons []map[string]string
 
     for _, each := range relation.Members {
-        way := cacheFetch(db, each.ID).(*jsonWay)
-        if way == nil {
-           log.Println("denormalize failed for relation:", relation.ID, "node not found:", each.ID)
-           return stringid, nil, nil
+        entity := cacheFetch(db, each.ID);
+        way, ok := entity.(*jsonWay)
+        if ok {
+            latlons = append(latlons, way.Centroid)
+        } else {
+            node, ok2 := entity.(*jsonNode)
+            if ok2 {
+               latlons = append(latlons, nodeLatLon(node))
+            } else {
+              log.Println("denormalize failed for relation:", relation.ID, "member not found:", each.ID)
+              return stringid, nil, nil
+            }
         }
-        latlons = append(latlons, way.Centroid)
     }
 
     if len(latlons) == 0 {
