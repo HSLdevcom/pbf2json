@@ -34,15 +34,15 @@ type jsonWay struct {
     ID   int64             `json:"id"`
     Type string            `json:"type"`
     Tags map[string]string `json:"tags"`
-    Centroid map[string]string   `json:"centroid"`
-    Nodes    []map[string]string `json:"nodes"`
+    Centroid map[string]float64 `json:"centroid"`
+    Nodes []map[string]float64  `json:"nodes"`
 }
 
 type jsonRelation struct {
     ID        int64               `json:"id"`
     Type      string              `json:"type"`
     Tags      map[string]string   `json:"tags"`
-    Centroid  map[string]string   `json:"centroid"`
+    Centroid  map[string]float64  `json:"centroid"`
 }
 
 
@@ -213,9 +213,9 @@ func cacheFlush(db *leveldb.DB, batch *leveldb.Batch) {
     batch.Reset()
 }
 
-func cacheLookup(db *leveldb.DB, way *osmpbf.Way) ([]map[string]string) {
+func cacheLookup(db *leveldb.DB, way *osmpbf.Way) ([]map[string]float64) {
 
-    var container []map[string]string
+    var container []map[string]float64
 
     for _, each := range way.NodeIDs {
         node, _ := cacheFetch(db, each).(*jsonNode)
@@ -230,8 +230,8 @@ func cacheLookup(db *leveldb.DB, way *osmpbf.Way) ([]map[string]string) {
     return container
 }
 
-func entranceLookup(db *leveldb.DB, way *osmpbf.Way) (location map[string]string, entranceType string) {
-     var latlon map[string]string
+func entranceLookup(db *leveldb.DB, way *osmpbf.Way) (location map[string]float64, entranceType string) {
+     var latlon map[string]float64
      eType := ""
 
      for _, each := range way.NodeIDs {
@@ -314,7 +314,7 @@ func formatWay(way *osmpbf.Way, db *leveldb.DB) (id string, val []byte, jway *js
     if latlons == nil {
         return stringid, nil, nil
     }
-    var centroid map[string]string
+    var centroid map[string]float64
     var centroidType string
     if isBuilding {
         centroid, centroidType = entranceLookup(db, way)
@@ -339,8 +339,8 @@ func formatRelation(relation *osmpbf.Relation, db *leveldb.DB) (id string, val [
     stringid := strconv.FormatInt(relation.ID, 10)
     var bufval bytes.Buffer
 
-    var latlons []map[string]string
-    var centroid map[string]string
+    var latlons []map[string]float64
+    var centroid map[string]float64
 
     var entranceFound bool
     for _, each := range relation.Members {
@@ -476,14 +476,12 @@ func hasTags(tags map[string]string) bool {
 }
 
 // compute the centroid of a way
-func computeCentroid(latlons []map[string]string) map[string]string {
+func computeCentroid(latlons []map[string]float64) map[string]float64 {
 
     // convert lat/lon map to geo.PointSet
     points := geo.NewPointSet()
     for _, each := range latlons {
-        var lon, _ = strconv.ParseFloat(each["lon"], 64)
-        var lat, _ = strconv.ParseFloat(each["lat"], 64)
-        points.Push(geo.NewPoint(lon, lat))
+        points.Push(geo.NewPoint(each["lon"], each["lat"]))
     }
 
     // determine if the way is a closed centroid or a linestring
@@ -502,14 +500,14 @@ func computeCentroid(latlons []map[string]string) map[string]string {
     }
 
     // return point as lat/lon map
-    var centroid = make(map[string]string)
-    centroid["lat"] = strconv.FormatFloat(compute.Lat(), 'f', 6, 64)
-    centroid["lon"] = strconv.FormatFloat(compute.Lng(), 'f', 6, 64)
+    var centroid = make(map[string]float64)
+    centroid["lat"] = compute.Lat()
+    centroid["lon"] = compute.Lng()
 
     return centroid
 }
 
-func entranceLatLon(node *jsonNode) (latlon map[string]string, entranceType string) {
+func entranceLatLon(node *jsonNode) (latlon map[string]float64, entranceType string) {
 
     if val, ok := node.Tags["entrance"]; ok {
         if val == "main" {
@@ -522,10 +520,10 @@ func entranceLatLon(node *jsonNode) (latlon map[string]string, entranceType stri
     return nil, ""
 }
 
-func nodeLatLon(node *jsonNode) map[string]string {
-      latlon := make(map[string]string)
-      latlon["lat"] = strconv.FormatFloat(node.Lat, 'f', 6, 64)
-      latlon["lon"] = strconv.FormatFloat(node.Lon, 'f', 6, 64)
+func nodeLatLon(node *jsonNode) map[string]float64 {
+      latlon := make(map[string]float64)
+      latlon["lat"] = node.Lat
+      latlon["lon"] = node.Lon
 
       return latlon
 }
