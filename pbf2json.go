@@ -256,7 +256,7 @@ func cacheFlush(db *leveldb.DB, batch *leveldb.Batch) {
     batch.Reset()
 }
 
-func cacheLookup(db *leveldb.DB, way *osmpbf.Way) ([]Point) {
+func geometryLookup(db *leveldb.DB, way *osmpbf.Way) ([]Point) {
 
     var container []Point
 
@@ -350,7 +350,7 @@ func formatWay(way *osmpbf.Way, db *leveldb.DB) (id string, val []byte, jway *js
     _, isBuilding := way.Tags["building"]
 
     // lookup from leveldb
-    points := cacheLookup(db, way)
+    points := geometryLookup(db, way)
 
     // skip ways which fail to denormalize
     if points == nil {
