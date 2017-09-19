@@ -16,6 +16,7 @@ import "github.com/qedus/osmpbf"
 import "github.com/syndtr/goleveldb/leveldb"
 import "github.com/paulmach/go.geo"
 
+const translateAddresses = true // disable if no multilang addresses are desired
 
 type Point struct {
     Lat  float64 `json:"lat"`
@@ -43,6 +44,8 @@ type jsonWay struct {
     Tags map[string]string `json:"tags"`
     Centroid Point         `json:"centroid"`
     Points []Point         `json:"points"`
+//    Min Point              `json:"min"`
+//    Max Point              `json:"max"`
 }
 
 type jsonRelation struct {
@@ -50,6 +53,8 @@ type jsonRelation struct {
     Type      string              `json:"type"`
     Tags      map[string]string   `json:"tags"`
     Centroid  Point               `json:"centroid"`
+//    Min Point                     `json:"min"`
+//    Max Point                     `json:"max"`
 }
 
 
@@ -82,6 +87,16 @@ func getSettings() settings {
     return settings{args[0], *leveldbPath, conditions, *batchSize}
 }
 
+func createDecoder(file *os.File) *osmpbf.Decoder {
+    decoder := osmpbf.NewDecoder(file)
+    err := decoder.Start(runtime.GOMAXPROCS(-1)) // use several goroutines for faster decoding
+    if err != nil {
+        log.Fatal(err)
+        os.Exit(1)
+    }
+    return decoder
+}
+
 func main() {
 
     // configuration
@@ -90,38 +105,41 @@ func main() {
     config.LevedbPath = filepath.Join(config.LevedbPath, "leveldb")
     os.MkdirAll(config.LevedbPath, os.ModePerm)
 
-    refmap := make(map[int64]bool)
+    refmap := make(map[int64]bool)         // these ids are needed by OSM reference
+    dictionaryIds := make(map[int64]bool)  // these ids may be needed for translation purposes
+    validIds := make(map[int64]bool)       // these ids will be outputted as matching items
+    dictionary := make(map[string][]int64) // translation map: name -> IDs of matching cached items
 
     // open pbf file
     file := openFile(config.PbfPath)
     defer file.Close()
 
-    decoder := osmpbf.NewDecoder(file)
-    err := decoder.Start(runtime.GOMAXPROCS(-1)) // use several goroutines for faster decoding
-    if err != nil {
-        log.Fatal(err)
-    }
-    collectRefs(decoder, refmap, config)
+    // pass 1: analyze and collect references
+    decoder := createDecoder(file)
+    collectRefs(decoder, config, refmap, dictionaryIds, dictionary)
 
-    fmt.Println(" ####### refs collected ######");
     file.Seek(0,0)
 
-    decoder = osmpbf.NewDecoder(file)
-    err = decoder.Start(runtime.GOMAXPROCS(-1))
-    if err != nil {
-        log.Fatal(err)
-    }
+    // pass 2: create cache for quick random access
+    decoder = createDecoder(file)
     db := openLevelDB(config.LevedbPath)
     defer db.Close()
+    createCache(decoder, config, refmap, dictionaryIds, dictionary, validIds, db)
 
-    run(decoder, db, config, refmap)
+    file.Seek(0,0)
+
+    // pass 3: output items that match tag selection
+    decoder = createDecoder(file)
+    outputValidEntries(decoder, config, refmap, dictionary, validIds, db)
 
     db.Close()
     os.RemoveAll(config.LevedbPath)
 }
 
-
-func collectRefs(d *osmpbf.Decoder, refmap map[int64]bool, config settings) {
+// look in advance which nodes are referred by ways and  relations,
+// and which ways are referred by relations
+// Then, at second parsing stage, we need to cache only relevant items
+func collectRefs(d *osmpbf.Decoder, config settings, refmap map[int64]bool, dictionaryIds map[int64]bool, dictionary map[string][]int64) {
     for {
         if v, err := d.Decode(); err == io.EOF {
             break
@@ -132,14 +150,18 @@ func collectRefs(d *osmpbf.Decoder, refmap map[int64]bool, config settings) {
             switch v := v.(type) {
 
             case *osmpbf.Way:
-                if _, ok := containsValidTags(v.Tags, config.Tags); ok {
+                tags, ok := containsValidTags(v.Tags, config.Tags)
+                toDict := toStreetDictionary(v.ID, tags, dictionaryIds, dictionary)
+                if ok || toDict {
                     for _, each := range v.NodeIDs {
                         refmap[each] = true
                     }
                 }
 
             case *osmpbf.Relation:
-                if _, ok := containsValidTags(trimTags(v.Tags), config.Tags); ok {
+                tags, ok := containsValidTags(v.Tags, config.Tags)
+                toDict := toStreetDictionary(v.ID, tags, dictionaryIds, dictionary)
+                if ok || toDict {
                     for _, each := range v.Members {
                         refmap[each.ID] = true
                     }
@@ -150,9 +172,11 @@ func collectRefs(d *osmpbf.Decoder, refmap map[int64]bool, config settings) {
             }
         }
     }
+    fmt.Println("\n##### Collected refs")
 }
 
-func run(d *osmpbf.Decoder, db *leveldb.DB, config settings, refmap map[int64]bool) {
+func createCache(d *osmpbf.Decoder, config settings, refmap map[int64]bool, dictionaryIds map[int64]bool,
+    dictionary map[string][]int64, validIds map[int64]bool, db *leveldb.DB) {
 
     batch := new(leveldb.Batch)
 
@@ -173,16 +197,16 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings, refmap map[int64]bo
             switch v := v.(type) {
 
             case *osmpbf.Node:
-                nc++
                 v.Tags, valid = containsValidTags(v.Tags, config.Tags)
                 if valid || refmap[v.ID] {
-                   id, data, jNode := formatNode(v)
+                   id, data, _ := formatNode(v)
                    cacheQueue(batch, id, data)
                    if batch.Len() > config.BatchSize {
                        cacheFlush(db, batch)
                    }
                    if valid {
-                       printJson(jNode)
+                       validIds[v.ID] = true
+                       nc++
                    }
                 }
 
@@ -191,49 +215,96 @@ func run(d *osmpbf.Decoder, db *leveldb.DB, config settings, refmap map[int64]bo
                 if prevtype != "way" {
                    prevtype = "way"
                    if batch.Len() > 1 {
-                      // flush outstanding node batches
                       cacheFlush(db, batch)
                    }
                 }
-                wc++
 
                 v.Tags, valid = containsValidTags(v.Tags, config.Tags)
-                if valid || refmap[v.ID] {
-                    id, data, jWay := formatWay(v, db)
+                if valid || refmap[v.ID] || dictionaryIds[v.ID] {
+                    id, data, _ := formatWay(v, db)
                     if data != nil { // valid entry
                         cacheQueue(batch, id, data)
                         if batch.Len() > config.BatchSize {
                             cacheFlush(db, batch)
                         }
                         if valid {
-                            printJson(jWay)
+                            validIds[v.ID] = true
+                            wc++
                         }
                     }
                 }
 
             case *osmpbf.Relation:
 
-                if batch.Len() > 1 {
-                    cacheFlush(db, batch)
+                if prevtype != "relation" {
+                   prevtype = "relation"
+                   if batch.Len() > 1 {
+                      cacheFlush(db, batch)
+                   }
                 }
-                rc++
 
-                if v.Tags, valid = containsValidTags(v.Tags, config.Tags); valid {
-                   _, _, jRel := formatRelation(v, db)
-                   if jRel != nil {
-                      printJson(jRel)
+                v.Tags, valid = containsValidTags(v.Tags, config.Tags)
+                if valid || dictionaryIds[v.ID] {
+                    id, data, _ := formatRelation(v, db)
+                    if data != nil {
+                        cacheQueue(batch, id, data)
+                        if batch.Len() > config.BatchSize {
+                            cacheFlush(db, batch)
+                        }
+                        if valid {
+                            validIds[v.ID] = true
+                            rc++
+                        }
                    }
                 }
 
             default:
-
                 log.Fatalf("unknown type %T\n", v)
 
             }
         }
     }
 
-    // fmt.Printf("Nodes: %d, Ways: %d, Relations: %d\n", nc, wc, rc)
+    fmt.Printf("##### \nCaching done. valid Nodes: %d, Ways: %d, Relations: %d\n", nc, wc, rc)
+}
+
+
+func outputValidEntries(d *osmpbf.Decoder, config settings, refmap map[int64]bool,
+    dictionary map[string][]int64, validIds map[int64]bool, db *leveldb.DB) {
+
+    for {
+        if v, err := d.Decode(); err == io.EOF {
+            break
+        } else if err != nil {
+            log.Fatal(err)
+        } else {
+            switch v := v.(type) {
+            case *osmpbf.Node:
+                if _, ok := validIds[v.ID]; !ok {
+                    continue
+                }
+                node, _ := cacheFetch(db, v.ID).(*jsonNode)
+                translateAddress(node.Tags, dictionary, db)
+                printJson(node)
+
+            case *osmpbf.Way:
+                if _, ok := validIds[v.ID]; !ok {
+                    continue
+                }
+                way, _ := cacheFetch(db, v.ID).(*jsonWay)
+                translateAddress(way.Tags, dictionary, db)
+                printJson(way)
+
+            case *osmpbf.Relation:
+                if _, ok := validIds[v.ID]; !ok {
+                    continue
+                }
+                rel, _ := cacheFetch(db, v.ID).(*jsonRelation)
+                translateAddress(rel.Tags, dictionary, db)
+                printJson(rel)
+            }
+        }
+    }
 }
 
 
@@ -507,6 +578,64 @@ func containsValidTags(tags map[string]string, group map[string][]string) (map[s
     return tags, false
 }
 
+// check if tags contain features which are useful for address translations
+func toStreetDictionary(ID int64, tags map[string]string, dictionaryIds map[int64]bool, dictionary map[string][]int64) bool {
+    if translateAddresses && hasTags(tags) {
+        if _, ok := tags["highway"]; ok {
+            if name, ok2 := tags["name"]; ok2 {
+                for k, v := range tags {
+                    if strings.Contains(k, "name:") && v != name {
+                        dictionaryIds[ID] = true
+                    /*    if dictionary[name] == nil {
+                            dictionary[name] = make([]int64, 0)
+                        } */
+                        dictionary[name] = append(dictionary[name], ID)
+                        return true
+                    }
+                }
+            }
+        }
+    }
+    return false
+}
+
+func translateAddress(tags map[string]string, dictionary map[string][]int64, db *leveldb.DB) {
+
+    if !translateAddresses {
+        return
+    }
+    var streetname, housenumber string
+    var ok bool
+    if streetname, ok = tags["address:street"]; !ok {
+       return
+    }
+    if housenumber, ok = tags["address:housenumber"]; !ok {
+       return
+    }
+
+    var tags2 map[string]string
+
+    if translations, ok2 := dictionary[tags["streetname"]]; ok2 {
+        for _, id := range translations {
+            entity := cacheFetch(db, id)
+            if way, ok3 := entity.(*jsonWay); ok3 {
+               tags2 = way.Tags
+            } else if rel, ok3 := entity.(*jsonRelation); ok3 {
+               tags2 = rel.Tags
+            } else {
+               log.Fatalf("Unexpected translation entity %d", id)
+            }
+            for k, v := range tags2 {
+                if strings.Contains(k, "name:") && streetname != v  {
+                    if _, ok = tags[k]; !ok { // name:lang entry not yet in use
+                       tags[k] = housenumber + " " + v // Hooray! Translated!
+                       fmt.Println("Translated", streetname, tags[k])
+                    }
+                }
+            }
+        }
+    }
+}
 
 // trim leading/trailing spaces from keys and values
 func trimTags(tags map[string]string) map[string]string {
