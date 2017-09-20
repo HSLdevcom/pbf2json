@@ -44,8 +44,8 @@ type jsonWay struct {
     Tags map[string]string `json:"tags"`
     Centroid Point         `json:"centroid"`
     Points []Point         `json:"points"`
-//    Min Point              `json:"min"`
-//    Max Point              `json:"max"`
+    BBoxMin  Point         `json:"bbox_min"`
+    BBoxMax  Point         `json:"bbox_max"`
 }
 
 type jsonRelation struct {
@@ -53,10 +53,41 @@ type jsonRelation struct {
     Type      string              `json:"type"`
     Tags      map[string]string   `json:"tags"`
     Centroid  Point               `json:"centroid"`
-//    Min Point                     `json:"min"`
-//    Max Point                     `json:"max"`
+    BBoxMin   Point               `json:"bbox_min"`
+    BBoxMax   Point               `json:"bbox_max"`
 }
 
+
+type cacheId struct {
+    ID int64
+    Type osmpbf.MemberType
+}
+
+type context struct {
+    file *os.File
+
+    nodes *leveldb.DB
+    ways *leveldb.DB
+    relations *leveldb.DB
+
+    // items which are needed because searched items refer to them
+    nodeRef map[int64]bool
+    wayRef map[int64]bool
+    relationRef map[int64]bool
+
+    // store time consuming tag comparison results to these maps
+    validNodes map[int64]bool
+    validWays map[int64]bool
+    validRelations map[int64]bool
+
+    // items which are needed in translating address type items to multiple languages
+    dictionaryWays map[int64]bool
+    dictionaryRelations map[int64]bool
+
+    translations map[string][]cacheId
+
+    config *settings
+}
 
 func getSettings() settings {
 
@@ -97,49 +128,90 @@ func createDecoder(file *os.File) *osmpbf.Decoder {
     return decoder
 }
 
-func main() {
-
-    // configuration
+func (context *context) init() {
+    // set up caches
     config := getSettings()
 
-    config.LevedbPath = filepath.Join(config.LevedbPath, "leveldb")
-    os.MkdirAll(config.LevedbPath, os.ModePerm)
-
-    refmap := make(map[int64]bool)         // these ids are needed by OSM reference
-    dictionaryIds := make(map[int64]bool)  // these ids may be needed for translation purposes
-    validIds := make(map[int64]bool)       // these ids will be outputted as matching items
-    dictionary := make(map[string][]int64) // translation map: name -> IDs of matching cached items
-
     // open pbf file
-    file := openFile(config.PbfPath)
-    defer file.Close()
+    context.file = openFile(config.PbfPath)
 
-    // pass 1: analyze and collect references
-    decoder := createDecoder(file)
-    collectRefs(decoder, config, refmap, dictionaryIds, dictionary)
+    config.LevedbPath = filepath.Join(config.LevedbPath, "leveldb")
+    nodePath := filepath.Join(config.LevedbPath, "nodes")
+    wayPath := filepath.Join(config.LevedbPath, "ways")
+    relationPath := filepath.Join(config.LevedbPath, "relations")
+    os.MkdirAll(nodePath, os.ModePerm)
+    os.MkdirAll(wayPath, os.ModePerm)
+    os.MkdirAll(relationPath, os.ModePerm)
+    context.config = &config
 
-    file.Seek(0,0)
+    // Actual leveldb caches
+    context.nodes = openLevelDB(nodePath)
+    context.ways = openLevelDB(wayPath)
+    context.relations = openLevelDB(relationPath)
 
-    // pass 2: create cache for quick random access
-    decoder = createDecoder(file)
-    db := openLevelDB(config.LevedbPath)
-    defer db.Close()
-    createCache(decoder, config, refmap, dictionaryIds, dictionary, validIds, db)
+    // set up reference maps
+    context.nodeRef = make(map[int64]bool) // these ids are needed by OSM references
+    context.wayRef = make(map[int64]bool)
+    context.relationRef = make(map[int64]bool)
 
-    file.Seek(0,0)
+    context.validNodes = make(map[int64]bool) // these ids will be outputted as matching items
+    context.validWays = make(map[int64]bool)
+    context.validRelations = make(map[int64]bool)
 
-    // pass 3: output items that match tag selection
-    decoder = createDecoder(file)
-    outputValidEntries(decoder, config, refmap, dictionary, validIds, db)
+    context.dictionaryWays = make(map[int64]bool) // these ids may be needed for translation purposes
+    context.dictionaryRelations = make(map[int64]bool)
 
-    db.Close()
-    os.RemoveAll(config.LevedbPath)
+    context.translations = make(map[string][]cacheId) // collected translation link map as name -> [cache references]
 }
 
-// look in advance which nodes are referred by ways and  relations,
+
+func (context *context) close() {
+    if context.nodes != nil {
+        context.nodes.Close()
+    }
+    if context.ways != nil {
+        context.ways.Close()
+    }
+    if context.relations != nil {
+        context.relations.Close()
+    }
+    if context.file != nil {
+       context.file.Close()
+    }
+
+    os.RemoveAll(context.config.LevedbPath)
+}
+
+func main() {
+    var context context
+
+    // configuration
+    context.init()
+    defer context.close()
+
+    // pass 1: analyze and collect references
+    decoder := createDecoder(context.file)
+    collectRefs(decoder, &context)
+
+    context.file.Seek(0,0)
+
+    // pass 2: create cache for quick random access
+    decoder = createDecoder(context.file)
+    createCache(decoder, &context)
+
+    context.file.Seek(0,0)
+
+    // pass 3: output items that match tag selection
+    decoder = createDecoder(context.file)
+    outputValidEntries(decoder, &context)
+
+    context.close()
+}
+
+// look in advance which nodes are referred by ways and relations,
 // and which ways are referred by relations
 // Then, at second parsing stage, we need to cache only relevant items
-func collectRefs(d *osmpbf.Decoder, config settings, refmap map[int64]bool, dictionaryIds map[int64]bool, dictionary map[string][]int64) {
+func collectRefs(d *osmpbf.Decoder, context *context) {
     for {
         if v, err := d.Decode(); err == io.EOF {
             break
@@ -150,34 +222,44 @@ func collectRefs(d *osmpbf.Decoder, config settings, refmap map[int64]bool, dict
             switch v := v.(type) {
 
             case *osmpbf.Way:
-                tags, ok := containsValidTags(v.Tags, config.Tags)
-                toDict := toStreetDictionary(v.ID, tags, dictionaryIds, dictionary)
+                tags, ok := containsValidTags(v.Tags, context.config.Tags)
+                toDict := toStreetDictionary(v.ID, osmpbf.WayType, tags, context.dictionaryWays, context.translations)
                 if ok || toDict {
                     for _, each := range v.NodeIDs {
-                        refmap[each] = true
+                        context.nodeRef[each] = true
                     }
                 }
 
             case *osmpbf.Relation:
-                tags, ok := containsValidTags(v.Tags, config.Tags)
-                toDict := toStreetDictionary(v.ID, tags, dictionaryIds, dictionary)
+                tags, ok := containsValidTags(v.Tags, context.config.Tags)
+                toDict := toStreetDictionary(v.ID, osmpbf.RelationType, tags, context.dictionaryRelations, context.translations)
                 if ok || toDict {
                     for _, each := range v.Members {
-                        refmap[each.ID] = true
+                        switch each.Type {
+                        case osmpbf.NodeType:
+                            context.nodeRef[each.ID] = true
+
+                        case osmpbf.WayType:
+                            context.wayRef[each.ID] = true
+
+                        case osmpbf.RelationType:
+                            context.relationRef[each.ID] = true
+                        }
                     }
                 }
 
             default:
-                // nop
+                // nop. Nodes do not refer to other items.
             }
         }
     }
     fmt.Println("\n##### Collected refs")
+    fmt.Printf("Dictionary size %d\n", len(context.translations))
 }
 
-func createCache(d *osmpbf.Decoder, config settings, refmap map[int64]bool, dictionaryIds map[int64]bool,
-    dictionary map[string][]int64, validIds map[int64]bool, db *leveldb.DB) {
+func createCache(d *osmpbf.Decoder, context *context) {
 
+    config := context.config
     batch := new(leveldb.Batch)
 
     var nc, wc, rc uint64
@@ -198,14 +280,14 @@ func createCache(d *osmpbf.Decoder, config settings, refmap map[int64]bool, dict
 
             case *osmpbf.Node:
                 v.Tags, valid = containsValidTags(v.Tags, config.Tags)
-                if valid || refmap[v.ID] {
+                if valid || context.nodeRef[v.ID] {
                    id, data, _ := formatNode(v)
                    cacheQueue(batch, id, data)
                    if batch.Len() > config.BatchSize {
-                       cacheFlush(db, batch)
+                       cacheFlush(context.nodes, batch)
                    }
                    if valid {
-                       validIds[v.ID] = true
+                       context.validNodes[v.ID] = true
                        nc++
                    }
                 }
@@ -215,20 +297,20 @@ func createCache(d *osmpbf.Decoder, config settings, refmap map[int64]bool, dict
                 if prevtype != "way" {
                    prevtype = "way"
                    if batch.Len() > 1 {
-                      cacheFlush(db, batch)
+                      cacheFlush(context.nodes, batch)
                    }
                 }
 
                 v.Tags, valid = containsValidTags(v.Tags, config.Tags)
-                if valid || refmap[v.ID] || dictionaryIds[v.ID] {
-                    id, data, _ := formatWay(v, db)
+                if valid || context.wayRef[v.ID] || context.dictionaryWays[v.ID] {
+                    id, data, _ := formatWay(v, context)
                     if data != nil { // valid entry
                         cacheQueue(batch, id, data)
                         if batch.Len() > config.BatchSize {
-                            cacheFlush(db, batch)
+                            cacheFlush(context.ways, batch)
                         }
                         if valid {
-                            validIds[v.ID] = true
+                            context.validWays[v.ID] = true
                             wc++
                         }
                     }
@@ -239,20 +321,20 @@ func createCache(d *osmpbf.Decoder, config settings, refmap map[int64]bool, dict
                 if prevtype != "relation" {
                    prevtype = "relation"
                    if batch.Len() > 1 {
-                      cacheFlush(db, batch)
+                      cacheFlush(context.ways, batch)
                    }
                 }
 
                 v.Tags, valid = containsValidTags(v.Tags, config.Tags)
-                if valid || dictionaryIds[v.ID] {
-                    id, data, _ := formatRelation(v, db)
+                if valid || context.relationRef[v.ID] || context.dictionaryRelations[v.ID] {
+                    id, data, _ := formatRelation(v, context)
                     if data != nil {
                         cacheQueue(batch, id, data)
                         if batch.Len() > config.BatchSize {
-                            cacheFlush(db, batch)
+                            cacheFlush(context.relations, batch)
                         }
                         if valid {
-                            validIds[v.ID] = true
+                            context.validRelations[v.ID] = true
                             rc++
                         }
                    }
@@ -264,13 +346,13 @@ func createCache(d *osmpbf.Decoder, config settings, refmap map[int64]bool, dict
             }
         }
     }
+    cacheFlush(context.relations, batch)
 
-    fmt.Printf("##### \nCaching done. valid Nodes: %d, Ways: %d, Relations: %d\n", nc, wc, rc)
+    fmt.Printf("\n##### Caching done. valid Nodes: %d, Ways: %d, Relations: %d\n", nc, wc, rc)
 }
 
 
-func outputValidEntries(d *osmpbf.Decoder, config settings, refmap map[int64]bool,
-    dictionary map[string][]int64, validIds map[int64]bool, db *leveldb.DB) {
+func outputValidEntries(d *osmpbf.Decoder, context *context) {
 
     for {
         if v, err := d.Decode(); err == io.EOF {
@@ -280,28 +362,23 @@ func outputValidEntries(d *osmpbf.Decoder, config settings, refmap map[int64]boo
         } else {
             switch v := v.(type) {
             case *osmpbf.Node:
-                if _, ok := validIds[v.ID]; !ok {
-                    continue
+                if _, ok := context.validNodes[v.ID]; ok {
+                    node := cacheFetch(context.nodes, v.ID).(*jsonNode)
+                    translateAddress(node.Tags, &Point{node.Lat, node.Lon}, context)
+                    printJson(node)
                 }
-                node, _ := cacheFetch(db, v.ID).(*jsonNode)
-                translateAddress(node.Tags, dictionary, db)
-                printJson(node)
-
             case *osmpbf.Way:
-                if _, ok := validIds[v.ID]; !ok {
-                    continue
+                if _, ok := context.validWays[v.ID]; ok {
+                    way := cacheFetch(context.ways, v.ID).(*jsonWay)
+                    translateAddress(way.Tags, &way.Centroid, context)
+                    printJson(way)
                 }
-                way, _ := cacheFetch(db, v.ID).(*jsonWay)
-                translateAddress(way.Tags, dictionary, db)
-                printJson(way)
-
             case *osmpbf.Relation:
-                if _, ok := validIds[v.ID]; !ok {
-                    continue
+                if _, ok := context.validRelations[v.ID]; ok {
+                    rel := cacheFetch(context.relations, v.ID).(*jsonRelation)
+                    translateAddress(rel.Tags, &rel.Centroid, context)
+                    printJson(rel)
                 }
-                rel, _ := cacheFetch(db, v.ID).(*jsonRelation)
-                translateAddress(rel.Tags, dictionary, db)
-                printJson(rel)
             }
         }
     }
@@ -313,13 +390,6 @@ func printJson(v interface{}) {
     fmt.Println(string(json))
 }
 
-// write to leveldb immediately
-func cacheStore(db *leveldb.DB, id string, val []byte) {
-    err := db.Put([]byte(id), []byte(val), nil)
-    if err != nil {
-        log.Fatal(err)
-    }
-}
 
 // queue a leveldb write in a batch
 func cacheQueue(batch *leveldb.Batch, id string, val []byte) {
@@ -340,9 +410,8 @@ func geometryLookup(db *leveldb.DB, way *osmpbf.Way) ([]Point) {
     var container []Point
 
     for _, each := range way.NodeIDs {
-        node, _ := cacheFetch(db, each).(*jsonNode)
+        node := cacheFetch(db, each).(*jsonNode)
         if node == nil {
-           // log.Println("denormalize failed for way:", way.ID, "node not found:", each)
            return nil
         }
         container = append(container, Point{Lat: node.Lat, Lon: node.Lon})
@@ -356,7 +425,7 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way) (location Point, entranceTy
      eType := ""
 
      for _, each := range way.NodeIDs {
-        node, _ := cacheFetch(db, each).(*jsonNode)
+        node := cacheFetch(db, each).(*jsonNode)
         if node == nil {
            return location, eType // bad reference, skip
         }
@@ -401,6 +470,11 @@ func cacheFetch(db *leveldb.DB, ID int64) interface{} {
        json.Unmarshal(data, &jWay)
        return &jWay
     }
+    if nodetype == "relation" {
+       jRel := jsonRelation{}
+       json.Unmarshal(data, &jRel)
+       return &jRel
+    }
 
     return nil
 }
@@ -420,7 +494,45 @@ func formatNode(node *osmpbf.Node) (id string, val []byte, jnode *jsonNode) {
     return stringid, byteval, &jNode
 }
 
-func formatWay(way *osmpbf.Way, db *leveldb.DB) (id string, val []byte, jway *jsonWay) {
+// expand bbox with a single point
+func expandBBox(p, bboxmin, bboxmax *Point) {
+     if p.Lat < bboxmin.Lat {
+         bboxmin.Lat = p.Lat
+     } else if p.Lat > bboxmax.Lat {
+         bboxmax.Lat = p.Lat
+     }
+     if p.Lon < bboxmin.Lon {
+         bboxmin.Lon = p.Lon
+     } else if p.Lon > bboxmax.Lon {
+         bboxmax.Lon = p.Lon
+     }
+}
+
+// merge 2 bboxes to latter one
+func sumBBox(bboxmin1, bboxmax1, bboxmin2, bboxmax2 *Point) {
+     if bboxmin1.Lat < bboxmin2.Lat {
+         bboxmin2.Lat = bboxmin1.Lat
+     }
+     if bboxmax1.Lat > bboxmax2.Lat {
+         bboxmax2.Lat = bboxmax1.Lat
+     }
+     if bboxmin1.Lon < bboxmin2.Lon {
+         bboxmin2.Lon = bboxmin1.Lon
+     }
+     if bboxmax1.Lon > bboxmax2.Lon {
+         bboxmax2.Lon = bboxmax1.Lon
+     }
+}
+
+// test
+func insideBBox(p, bboxmin, bboxmax *Point) bool {
+     return p.Lat >= bboxmin.Lat &&
+            p.Lat <= bboxmax.Lat &&
+            p.Lon >= bboxmin.Lon &&
+            p.Lon <= bboxmax.Lon
+}
+
+func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *jsonWay) {
 
     stringid := strconv.FormatInt(way.ID, 10)
     var bufval bytes.Buffer
@@ -429,16 +541,24 @@ func formatWay(way *osmpbf.Way, db *leveldb.DB) (id string, val []byte, jway *js
     _, isBuilding := way.Tags["building"]
 
     // lookup from leveldb
-    points := geometryLookup(db, way)
+    points := geometryLookup(context.nodes, way)
 
     // skip ways which fail to denormalize
     if points == nil {
         return stringid, nil, nil
     }
+
+    bboxmin := points[0]
+    bboxmax := bboxmin
+
+    for _, p := range points {
+        expandBBox(&p, &bboxmin, &bboxmax)
+    }
+
     var centroid Point
     var centroidType string
     if isBuilding {
-        centroid, centroidType = entranceLookup(db, way)
+        centroid, centroidType = entranceLookup(context.nodes, way)
     }
 
     if centroidType == "" {
@@ -446,7 +566,7 @@ func formatWay(way *osmpbf.Way, db *leveldb.DB) (id string, val []byte, jway *js
         centroidType = "average"
     }
     way.Tags["_centroidType"] = centroidType;
-    jWay := jsonWay{way.ID, "way", way.Tags, centroid, points}
+    jWay := jsonWay{way.ID, "way", way.Tags, centroid, points, bboxmin, bboxmax}
     json, _ := json.Marshal(jWay)
 
     bufval.WriteString(string(json))
@@ -455,7 +575,7 @@ func formatWay(way *osmpbf.Way, db *leveldb.DB) (id string, val []byte, jway *js
     return stringid, byteval, &jWay
 }
 
-func formatRelation(relation *osmpbf.Relation, db *leveldb.DB) (id string, val []byte, rel *jsonRelation) {
+func formatRelation(relation *osmpbf.Relation, context *context) (id string, val []byte, rel *jsonRelation) {
 
     stringid := strconv.FormatInt(relation.ID, 10)
     var bufval bytes.Buffer
@@ -463,49 +583,93 @@ func formatRelation(relation *osmpbf.Relation, db *leveldb.DB) (id string, val [
     var points []Point
     var centroid Point
 
-    var entranceFound bool
-    for _, each := range relation.Members {
-        entity := cacheFetch(db, each.ID);
-        way, ok := entity.(*jsonWay)
-        if ok {
-            if cType, ok := way.Tags["_centroidType"]; ok {
-                entranceFound = true
-                centroid = way.Centroid
-                if cType == "mainEntrance" {
-                    break // use first detected main entrance
-                }
-            } else {
-                points = append(points, way.Centroid)
-            }
-        } else {
-            node, ok2 := entity.(*jsonNode)
-            if ok2 {
+    var bboxmin, bboxmax Point
+    bbox_init := false
 
-                if val, _type := entranceLocation(node); _type != "" {
-                    entranceFound = true
-                    centroid = val
-                    if _type == "mainEntrance" {
-                        break
+    centroidType := ""
+    for _, each := range relation.Members {
+        switch each.Type {
+
+        case osmpbf.NodeType:
+            if node, ok := cacheFetch(context.nodes, each.ID).(*jsonNode); ok {
+                p := Point{Lat:node.Lat, Lon:node.Lon}
+                if !bbox_init {
+                    bboxmin = p
+                    bboxmax = p
+                    bbox_init = true
+                } else {
+                    expandBBox(&p, &bboxmin, &bboxmax)
+                }
+                if val, cType := entranceLocation(node); cType != "" {
+                    if centroidType == "" || cType == "mainEntrance" {
+                        centroid = val
+                        centroidType = cType
                     }
                 } else {
-                    points = append(points, Point{Lat:node.Lat, Lon:node.Lon})
+                    points = append(points, p)
+                }
+            } else { // broken ref, skip
+                return stringid, nil, nil
+            }
+
+        case osmpbf.WayType:
+            if way, ok := cacheFetch(context.ways, each.ID).(*jsonWay); ok {
+                if cType, ok := way.Tags["_centroidType"]; ok && cType != "average" {
+                    if centroidType == "" || cType == "mainEntrance" {
+                        centroid = way.Centroid
+                        centroidType = cType
+                    }
+                } else {
+                    points = append(points, way.Centroid)
+                }
+                if !bbox_init {
+                    bboxmin = way.BBoxMin
+                    bboxmax = way.BBoxMax
+                    bbox_init = true
+                } else {
+                    sumBBox(&way.BBoxMin, &way.BBoxMax, &bboxmin, &bboxmax)
                 }
             } else {
-                // log.Println("denormalize failed for relation:", relation.ID, "member not found:", each.ID)
                 return stringid, nil, nil
+            }
+
+        case osmpbf.RelationType:
+            // relations referring to relations are problematic. Simplify a bit.
+            if relation, ok := cacheFetch(context.relations, each.ID).(*jsonRelation); ok {
+                if cType, ok := relation.Tags["_centroidType"]; ok && cType != "average" {
+                    if centroidType == "" || cType == "mainEntrance" {
+                        centroid = relation.Centroid
+                        centroidType = cType
+                    }
+                } else {
+                    points = append(points, relation.Centroid)
+                }
+                if !bbox_init {
+                    bboxmin = relation.BBoxMin
+                    bboxmax = relation.BBoxMax
+                    bbox_init = true
+                } else {
+                    sumBBox(&relation.BBoxMin, &relation.BBoxMax, &bboxmin, &bboxmax)
+                }
+
+            } else {
+                ; // nop. accept the fact that referred relation is not yet in cache
             }
         }
     }
 
-    if !entranceFound {
+    if centroidType == "" {
         if len(points) == 0 {
            log.Println("Skipping relation without location: ", relation.ID)
            return stringid, nil, nil
         }
         centroid = computeCentroid(points)
+        centroidType = "average"
     }
 
-    jRelation := jsonRelation{relation.ID, "relation", relation.Tags, centroid}
+    relation.Tags["_centroidType"] = centroidType;
+
+    jRelation := jsonRelation{relation.ID, "relation", relation.Tags, centroid, bboxmin, bboxmax}
     json, _ := json.Marshal(jRelation)
 
     bufval.WriteString(string(json))
@@ -579,17 +743,16 @@ func containsValidTags(tags map[string]string, group map[string][]string) (map[s
 }
 
 // check if tags contain features which are useful for address translations
-func toStreetDictionary(ID int64, tags map[string]string, dictionaryIds map[int64]bool, dictionary map[string][]int64) bool {
+func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]string, dictionaryIds map[int64]bool, dictionary map[string][]cacheId) bool {
+
     if translateAddresses && hasTags(tags) {
         if _, ok := tags["highway"]; ok {
             if name, ok2 := tags["name"]; ok2 {
                 for k, v := range tags {
                     if strings.Contains(k, "name:") && v != name {
+                        cid := cacheId{ID, mtype}
                         dictionaryIds[ID] = true
-                    /*    if dictionary[name] == nil {
-                            dictionary[name] = make([]int64, 0)
-                        } */
-                        dictionary[name] = append(dictionary[name], ID)
+                        dictionary[name] = append(dictionary[name], cid)
                         return true
                     }
                 }
@@ -599,7 +762,7 @@ func toStreetDictionary(ID int64, tags map[string]string, dictionaryIds map[int6
     return false
 }
 
-func translateAddress(tags map[string]string, dictionary map[string][]int64, db *leveldb.DB) {
+func translateAddress(tags map[string]string, location *Point, context *context) {
 
     if !translateAddresses {
         return
@@ -615,21 +778,37 @@ func translateAddress(tags map[string]string, dictionary map[string][]int64, db 
 
     var tags2 map[string]string
 
-    if translations, ok2 := dictionary[tags["streetname"]]; ok2 {
-        for _, id := range translations {
-            entity := cacheFetch(db, id)
-            if way, ok3 := entity.(*jsonWay); ok3 {
-               tags2 = way.Tags
-            } else if rel, ok3 := entity.(*jsonRelation); ok3 {
-               tags2 = rel.Tags
-            } else {
-               log.Fatalf("Unexpected translation entity %d", id)
+    if translations, ok2 := context.translations[streetname]; ok2 {
+        fmt.Println("looking translation for", streetname)
+
+        for _, cid := range translations {
+            switch cid.Type {
+
+            case osmpbf.WayType:
+                if way, ok := cacheFetch(context.ways, cid.ID).(*jsonWay); ok {
+                    if !insideBBox(location, &way.BBoxMin, &way.BBoxMax) {
+                        continue;
+                    }
+                    tags2 = way.Tags
+                }
+
+            case osmpbf.RelationType:
+                if rel, ok := cacheFetch(context.relations, cid.ID).(*jsonRelation); ok {
+                    if !insideBBox(location, &rel.BBoxMin, &rel.BBoxMax) {
+                        continue;
+                    }
+                    tags2 = rel.Tags
+                }
+
+            default:
+                log.Fatalf("Unexpected translation entity %d", cid.ID)
             }
+
             for k, v := range tags2 {
                 if strings.Contains(k, "name:") && streetname != v  {
                     if _, ok = tags[k]; !ok { // name:lang entry not yet in use
                        tags[k] = housenumber + " " + v // Hooray! Translated!
-                       fmt.Println("Translated", streetname, tags[k])
+                       fmt.Println("\n#########Translated", streetname, tags[k])
                     }
                 }
             }
