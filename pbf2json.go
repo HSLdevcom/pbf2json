@@ -18,6 +18,8 @@ import "github.com/paulmach/go.geo"
 
 const translateAddresses = true // disable if no multilang addresses are desired
 
+var trans_cnt = 0
+
 type Point struct {
     Lat  float64 `json:"lat"`
     Lon  float64 `json:"lon"`
@@ -253,8 +255,8 @@ func collectRefs(d *osmpbf.Decoder, context *context) {
             }
         }
     }
-    fmt.Println("\n##### Collected refs")
-    fmt.Printf("Dictionary size %d\n", len(context.translations))
+//    fmt.Println("\n##### Collected refs")
+//    fmt.Printf("Dictionary size %d\n", len(context.translations))
 }
 
 func createCache(d *osmpbf.Decoder, context *context) {
@@ -348,7 +350,7 @@ func createCache(d *osmpbf.Decoder, context *context) {
     }
     cacheFlush(context.relations, batch)
 
-    fmt.Printf("\n##### Caching done. valid Nodes: %d, Ways: %d, Relations: %d\n", nc, wc, rc)
+    // fmt.Printf("\n##### Caching done. valid Nodes: %d, Ways: %d, Relations: %d\n", nc, wc, rc)
 }
 
 
@@ -410,8 +412,8 @@ func geometryLookup(db *leveldb.DB, way *osmpbf.Way) ([]Point) {
     var container []Point
 
     for _, each := range way.NodeIDs {
-        node := cacheFetch(db, each).(*jsonNode)
-        if node == nil {
+        node, ok := cacheFetch(db, each).(*jsonNode)
+        if !ok {
            return nil
         }
         container = append(container, Point{Lat: node.Lat, Lon: node.Lon})
@@ -425,8 +427,8 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way) (location Point, entranceTy
      eType := ""
 
      for _, each := range way.NodeIDs {
-        node := cacheFetch(db, each).(*jsonNode)
-        if node == nil {
+        node, ok := cacheFetch(db, each).(*jsonNode)
+        if !ok {
            return location, eType // bad reference, skip
         }
 
@@ -660,7 +662,7 @@ func formatRelation(relation *osmpbf.Relation, context *context) (id string, val
 
     if centroidType == "" {
         if len(points) == 0 {
-           log.Println("Skipping relation without location: ", relation.ID)
+           // skip relation if no geometry was found
            return stringid, nil, nil
         }
         centroid = computeCentroid(points)
@@ -769,18 +771,16 @@ func translateAddress(tags map[string]string, location *Point, context *context)
     }
     var streetname, housenumber string
     var ok bool
-    if streetname, ok = tags["address:street"]; !ok {
+    if streetname, ok = tags["addr:street"]; !ok {
        return
     }
-    if housenumber, ok = tags["address:housenumber"]; !ok {
+    if housenumber, ok = tags["addr:housenumber"]; !ok {
        return
     }
 
     var tags2 map[string]string
 
     if translations, ok2 := context.translations[streetname]; ok2 {
-        fmt.Println("looking translation for", streetname)
-
         for _, cid := range translations {
             switch cid.Type {
 
@@ -805,10 +805,15 @@ func translateAddress(tags map[string]string, location *Point, context *context)
             }
 
             for k, v := range tags2 {
-                if strings.Contains(k, "name:") && streetname != v  {
-                    if _, ok = tags[k]; !ok { // name:lang entry not yet in use
+                if strings.HasPrefix(k, "name:") && streetname != v  {
+                    if _, ok = tags[k]; false && !ok { // name:lang entry not yet in use
                        tags[k] = housenumber + " " + v // Hooray! Translated!
-                       fmt.Println("\n#########Translated", streetname, tags[k])
+                    } else {
+                        postfix := strings.TrimPrefix(k, "name:")
+                        k2 := "addr:street:" + postfix // eg addr:street:sv
+                        if _, ok = tags[k2]; !ok { // not yet used
+                            tags[k2] = v
+                        }
                     }
                 }
             }
