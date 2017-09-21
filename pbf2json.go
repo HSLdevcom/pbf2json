@@ -191,29 +191,33 @@ func main() {
     context.init()
     defer context.close()
 
-    // pass 1: analyze and collect references
+    // pass 1: analyze and collect relation references
     decoder := createDecoder(context.file)
-    collectRefs(decoder, &context)
+    collectRelationRefs(decoder, &context)
 
     context.file.Seek(0,0)
 
-    // pass 2: create cache for quick random access
+    // pass 2: analyze and collect way references
+    decoder = createDecoder(context.file)
+    collectWayRefs(decoder, &context)
+
+    context.file.Seek(0,0)
+
+    // pass 3: create cache for quick random access
     decoder = createDecoder(context.file)
     createCache(decoder, &context)
 
     context.file.Seek(0,0)
 
-    // pass 3: output items that match tag selection
+    // pass 4: output items that match tag selection
     decoder = createDecoder(context.file)
     outputValidEntries(decoder, &context)
 
     context.close()
 }
 
-// look in advance which nodes are referred by ways and relations,
-// and which ways are referred by relations
-// Then, at second parsing stage, we need to cache only relevant items
-func collectRefs(d *osmpbf.Decoder, context *context) {
+// look in advance which items are referred by relations
+func collectRelationRefs(d *osmpbf.Decoder, context *context) {
     for {
         if v, err := d.Decode(); err == io.EOF {
             break
@@ -222,15 +226,6 @@ func collectRefs(d *osmpbf.Decoder, context *context) {
         } else {
 
             switch v := v.(type) {
-
-            case *osmpbf.Way:
-                tags, ok := containsValidTags(v.Tags, context.config.Tags)
-                toDict := toStreetDictionary(v.ID, osmpbf.WayType, tags, context.dictionaryWays, context.translations)
-                if ok || toDict {
-                    for _, each := range v.NodeIDs {
-                        context.nodeRef[each] = true
-                    }
-                }
 
             case *osmpbf.Relation:
                 tags, ok := containsValidTags(v.Tags, context.config.Tags)
@@ -249,14 +244,34 @@ func collectRefs(d *osmpbf.Decoder, context *context) {
                         }
                     }
                 }
-
-            default:
-                // nop. Nodes do not refer to other items.
             }
         }
     }
-//    fmt.Println("\n##### Collected refs")
-//    fmt.Printf("Dictionary size %d\n", len(context.translations))
+}
+
+// look in advance which nodes are referred by ways
+func collectWayRefs(d *osmpbf.Decoder, context *context) {
+    for {
+        if v, err := d.Decode(); err == io.EOF {
+            break
+        } else if err != nil {
+            log.Fatal(err)
+        } else {
+
+            switch v := v.(type) {
+
+            case *osmpbf.Way:
+                tags, ok := containsValidTags(v.Tags, context.config.Tags)
+                toDict := toStreetDictionary(v.ID, osmpbf.WayType, tags, context.dictionaryWays, context.translations)
+                if ok || toDict || context.wayRef[v.ID] == true {
+                    for _, each := range v.NodeIDs {
+                        context.nodeRef[each] = true
+                    }
+                }
+            }
+        }
+    }
+    // fmt.Printf("Dictionary size %d\n", len(context.translations))
 }
 
 func createCache(d *osmpbf.Decoder, context *context) {
@@ -339,7 +354,7 @@ func createCache(d *osmpbf.Decoder, context *context) {
                             context.validRelations[v.ID] = true
                             rc++
                         }
-                   }
+                    }
                 }
 
             default:
