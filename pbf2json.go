@@ -18,8 +18,6 @@ import "github.com/paulmach/go.geo"
 
 const translateAddresses = true // disable if no multilang addresses are desired
 
-var trans_cnt = 0
-
 type Point struct {
     Lat  float64 `json:"lat"`
     Lon  float64 `json:"lon"`
@@ -28,7 +26,7 @@ type Point struct {
 type settings struct {
     PbfPath    string
     LevedbPath string
-    Tags       map[string][]string
+    Tags       map[int][][]string
     BatchSize  int
 }
 
@@ -45,7 +43,6 @@ type jsonWay struct {
     Type string            `json:"type"`
     Tags map[string]string `json:"tags"`
     Centroid Point         `json:"centroid"`
-    Points []Point         `json:"points"`
     BBoxMin  Point         `json:"bbox_min"`
     BBoxMax  Point         `json:"bbox_max"`
 }
@@ -70,17 +67,20 @@ type context struct {
 
     nodes *leveldb.DB
     ways *leveldb.DB
-    relations *leveldb.DB
 
     // items which are needed because searched items refer to them
     nodeRef map[int64]bool
     wayRef map[int64]bool
-    relationRef map[int64]bool
 
     // store time consuming tag comparison results to these maps
     validNodes map[int64]bool
     validWays map[int64]bool
     validRelations map[int64]bool
+
+    // put relations to memory resident map for quick access in resolving cross references
+    relations map[int64]*osmpbf.Relation
+    formattedRelations map[int64]*jsonRelation
+    pendingRelations map[int64]bool
 
     // items which are needed in translating address type items to multiple languages
     dictionaryWays map[int64]bool
@@ -112,9 +112,11 @@ func getSettings() settings {
     }
 
     // parse tag conditions
-    conditions := make(map[string][]string)
-    for _, group := range strings.Split(*tagList, ",") {
-        conditions[group] = strings.Split(group, "+")
+    conditions := make(map[int][][]string)
+    for i, group := range strings.Split(*tagList, ",") {
+        for _, keyval := range strings.Split(group, "+") {
+            conditions[i] = append(conditions[i], strings.Split(keyval, "~"))
+        }
     }
 
     return settings{args[0], *leveldbPath, conditions, *batchSize}
@@ -140,25 +142,27 @@ func (context *context) init() {
     config.LevedbPath = filepath.Join(config.LevedbPath, "leveldb")
     nodePath := filepath.Join(config.LevedbPath, "nodes")
     wayPath := filepath.Join(config.LevedbPath, "ways")
-    relationPath := filepath.Join(config.LevedbPath, "relations")
+
     os.MkdirAll(nodePath, os.ModePerm)
     os.MkdirAll(wayPath, os.ModePerm)
-    os.MkdirAll(relationPath, os.ModePerm)
+
     context.config = &config
 
     // Actual leveldb caches
     context.nodes = openLevelDB(nodePath)
     context.ways = openLevelDB(wayPath)
-    context.relations = openLevelDB(relationPath)
 
     // set up reference maps
     context.nodeRef = make(map[int64]bool) // these ids are needed by OSM references
     context.wayRef = make(map[int64]bool)
-    context.relationRef = make(map[int64]bool)
 
     context.validNodes = make(map[int64]bool) // these ids will be outputted as matching items
     context.validWays = make(map[int64]bool)
     context.validRelations = make(map[int64]bool)
+
+    context.relations = make(map[int64]*osmpbf.Relation)
+    context.formattedRelations = make(map[int64]*jsonRelation)
+    context.pendingRelations = make(map[int64]bool) // resolve state map to stop infinite recursion
 
     context.dictionaryWays = make(map[int64]bool) // these ids may be needed for translation purposes
     context.dictionaryRelations = make(map[int64]bool)
@@ -173,9 +177,6 @@ func (context *context) close() {
     }
     if context.ways != nil {
         context.ways.Close()
-    }
-    if context.relations != nil {
-        context.relations.Close()
     }
     if context.file != nil {
        context.file.Close()
@@ -203,15 +204,12 @@ func main() {
 
     context.file.Seek(0,0)
 
-    // pass 3: create cache for quick random access
+    // pass 3: create cache for quick random access. Output matching items on the fly.
     decoder = createDecoder(context.file)
     createCache(decoder, &context)
 
-    context.file.Seek(0,0)
-
-    // pass 4: output items that match tag selection
-    decoder = createDecoder(context.file)
-    outputValidEntries(decoder, &context)
+    // output items that match tag selection
+    outputValidEntries(&context)
 
     context.close()
 }
@@ -228,20 +226,21 @@ func collectRelationRefs(d *osmpbf.Decoder, context *context) {
             switch v := v.(type) {
 
             case *osmpbf.Relation:
-                tags, ok := containsValidTags(v.Tags, context.config.Tags)
-                toDict := toStreetDictionary(v.ID, osmpbf.RelationType, tags, context.dictionaryRelations, context.translations)
-                if ok || toDict {
-                    for _, each := range v.Members {
-                        switch each.Type {
+                tags, valid := containsValidTags(v.Tags, context.config.Tags)
+                toStreetDictionary(v.ID, osmpbf.RelationType, tags, context.dictionaryRelations, context.translations)
+                context.relations[v.ID] = v
+                if valid {
+                    context.validRelations[v.ID] = true
+                }
+
+                // always cache all relations and items referred by them
+                for _, each := range v.Members {
+                    switch each.Type {
                         case osmpbf.NodeType:
                             context.nodeRef[each.ID] = true
 
                         case osmpbf.WayType:
                             context.wayRef[each.ID] = true
-
-                        case osmpbf.RelationType:
-                            context.relationRef[each.ID] = true
-                        }
                     }
                 }
             }
@@ -279,7 +278,6 @@ func createCache(d *osmpbf.Decoder, context *context) {
     config := context.config
     batch := new(leveldb.Batch)
 
-    var nc, wc, rc uint64
     var valid bool
 
     // NOTE: this logic expects that parser outputs all nodes
@@ -299,13 +297,14 @@ func createCache(d *osmpbf.Decoder, context *context) {
                 v.Tags, valid = containsValidTags(v.Tags, config.Tags)
                 if valid || context.nodeRef[v.ID] {
                    id, data, _ := formatNode(v)
-                   cacheQueue(batch, id, data)
-                   if batch.Len() > config.BatchSize {
-                       cacheFlush(context.nodes, batch)
-                   }
-                   if valid {
-                       context.validNodes[v.ID] = true
-                       nc++
+                   if data != nil {
+                       cacheQueue(batch, id, data)
+                       if batch.Len() > config.BatchSize {
+                           cacheFlush(context.nodes, batch)
+                       }
+                       if valid {
+                           context.validNodes[v.ID] = true
+                       }
                    }
                 }
 
@@ -328,76 +327,46 @@ func createCache(d *osmpbf.Decoder, context *context) {
                         }
                         if valid {
                             context.validWays[v.ID] = true
-                            wc++
                         }
                     }
                 }
 
             case *osmpbf.Relation:
 
-                if prevtype != "relation" {
-                   prevtype = "relation"
-                   if batch.Len() > 1 {
+               if batch.Len() > 1 {
+                   if prevtype == "node" {
+                      cacheFlush(context.nodes, batch)
+                   } else {
                       cacheFlush(context.ways, batch)
                    }
                 }
 
-                v.Tags, valid = containsValidTags(v.Tags, config.Tags)
-                if valid || context.relationRef[v.ID] || context.dictionaryRelations[v.ID] {
-                    id, data, _ := formatRelation(v, context)
-                    if data != nil {
-                        cacheQueue(batch, id, data)
-                        if batch.Len() > config.BatchSize {
-                            cacheFlush(context.relations, batch)
-                        }
-                        if valid {
-                            context.validRelations[v.ID] = true
-                            rc++
-                        }
-                    }
+                if context.validRelations[v.ID] || context.dictionaryRelations[v.ID] {
+                   if formatRelation(context.relations[v.ID], context) == nil {
+                      delete(context.validRelations, v.ID)
+                   }
                 }
-
-            default:
-                log.Fatalf("unknown type %T\n", v)
-
             }
         }
     }
-    cacheFlush(context.relations, batch)
-
-    // fmt.Printf("\n##### Caching done. valid Nodes: %d, Ways: %d, Relations: %d\n", nc, wc, rc)
 }
 
+func outputValidEntries(context *context) {
 
-func outputValidEntries(d *osmpbf.Decoder, context *context) {
-
-    for {
-        if v, err := d.Decode(); err == io.EOF {
-            break
-        } else if err != nil {
-            log.Fatal(err)
-        } else {
-            switch v := v.(type) {
-            case *osmpbf.Node:
-                if _, ok := context.validNodes[v.ID]; ok {
-                    node := cacheFetch(context.nodes, v.ID).(*jsonNode)
-                    translateAddress(node.Tags, &Point{node.Lat, node.Lon}, context)
-                    printJson(node)
-                }
-            case *osmpbf.Way:
-                if _, ok := context.validWays[v.ID]; ok {
-                    way := cacheFetch(context.ways, v.ID).(*jsonWay)
-                    translateAddress(way.Tags, &way.Centroid, context)
-                    printJson(way)
-                }
-            case *osmpbf.Relation:
-                if _, ok := context.validRelations[v.ID]; ok {
-                    rel := cacheFetch(context.relations, v.ID).(*jsonRelation)
-                    translateAddress(rel.Tags, &rel.Centroid, context)
-                    printJson(rel)
-                }
-            }
-        }
+    for id, _ := range context.validNodes {
+        node := cacheFetch(context.nodes, id).(*jsonNode)
+        translateAddress(node.Tags, &Point{node.Lat, node.Lon}, context)
+        printJson(node)
+    }
+    for id, _ := range context.validWays {
+        way := cacheFetch(context.ways, id).(*jsonWay)
+        translateAddress(way.Tags, &way.Centroid, context)
+        printJson(way)
+    }
+    for id, _ := range context.validRelations {
+        relation := context.formattedRelations[id]
+        translateAddress(relation.Tags, &relation.Centroid, context)
+        printJson(relation)
     }
 }
 
@@ -422,7 +391,7 @@ func cacheFlush(db *leveldb.DB, batch *leveldb.Batch) {
     batch.Reset()
 }
 
-func geometryLookup(db *leveldb.DB, way *osmpbf.Way) ([]Point) {
+func collectPoints(db *leveldb.DB, way *osmpbf.Way) ([]Point) {
 
     var container []Point
 
@@ -486,11 +455,6 @@ func cacheFetch(db *leveldb.DB, ID int64) interface{} {
        jWay := jsonWay{}
        json.Unmarshal(data, &jWay)
        return &jWay
-    }
-    if nodetype == "relation" {
-       jRel := jsonRelation{}
-       json.Unmarshal(data, &jRel)
-       return &jRel
     }
 
     return nil
@@ -558,7 +522,7 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
     _, isBuilding := way.Tags["building"]
 
     // lookup from leveldb
-    points := geometryLookup(context.nodes, way)
+    points := collectPoints(context.nodes, way)
 
     // skip ways which fail to denormalize
     if points == nil {
@@ -583,7 +547,7 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
         centroidType = "average"
     }
     way.Tags["_centroidType"] = centroidType;
-    jWay := jsonWay{way.ID, "way", way.Tags, centroid, points, bboxmin, bboxmax}
+    jWay := jsonWay{way.ID, "way", way.Tags, centroid, bboxmin, bboxmax}
     json, _ := json.Marshal(jWay)
 
     bufval.WriteString(string(json))
@@ -592,10 +556,17 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
     return stringid, byteval, &jWay
 }
 
-func formatRelation(relation *osmpbf.Relation, context *context) (id string, val []byte, rel *jsonRelation) {
+func formatRelation(relation *osmpbf.Relation, context *context) *jsonRelation {
 
-    stringid := strconv.FormatInt(relation.ID, 10)
-    var bufval bytes.Buffer
+    if _rel, ok := context.formattedRelations[relation.ID]; ok {
+        return _rel // already done
+    }
+    if _, ok := context.pendingRelations[relation.ID]; ok {
+        return nil // cycle, stop!
+    }
+
+    context.pendingRelations[relation.ID] = true // mark to stop cyclic resolving
+    defer delete(context.pendingRelations, relation.ID)
 
     var points []Point
     var centroid Point
@@ -626,7 +597,7 @@ func formatRelation(relation *osmpbf.Relation, context *context) (id string, val
                     points = append(points, p)
                 }
             } else { // broken ref, skip
-                return stringid, nil, nil
+                return nil
             }
 
         case osmpbf.WayType:
@@ -647,30 +618,30 @@ func formatRelation(relation *osmpbf.Relation, context *context) (id string, val
                     sumBBox(&way.BBoxMin, &way.BBoxMax, &bboxmin, &bboxmax)
                 }
             } else {
-                return stringid, nil, nil
+                return nil
             }
 
         case osmpbf.RelationType:
-            // relations referring to relations are problematic. Simplify a bit.
-            if relation, ok := cacheFetch(context.relations, each.ID).(*jsonRelation); ok {
-                if cType, ok := relation.Tags["_centroidType"]; ok && cType != "average" {
-                    if centroidType == "" || cType == "mainEntrance" {
-                        centroid = relation.Centroid
-                        centroidType = cType
-                    }
-                } else {
-                    points = append(points, relation.Centroid)
-                }
-                if !bbox_init {
-                    bboxmin = relation.BBoxMin
-                    bboxmax = relation.BBoxMax
-                    bbox_init = true
-                } else {
-                    sumBBox(&relation.BBoxMin, &relation.BBoxMax, &bboxmin, &bboxmax)
-                }
+            var relation *jsonRelation
+            relation = formatRelation(context.relations[each.ID], context) // recurse
+            if relation == nil {
+                return nil
+            }
 
+            if cType, ok := relation.Tags["_centroidType"]; ok && cType != "average" {
+                if centroidType == "" || cType == "mainEntrance" {
+                    centroid = relation.Centroid
+                    centroidType = cType
+                }
             } else {
-                ; // nop. accept the fact that referred relation is not yet in cache
+                points = append(points, relation.Centroid)
+            }
+            if !bbox_init {
+                bboxmin = relation.BBoxMin
+                bboxmax = relation.BBoxMax
+                bbox_init = true
+            } else {
+                sumBBox(&relation.BBoxMin, &relation.BBoxMax, &bboxmin, &bboxmax)
             }
         }
     }
@@ -678,7 +649,7 @@ func formatRelation(relation *osmpbf.Relation, context *context) (id string, val
     if centroidType == "" {
         if len(points) == 0 {
            // skip relation if no geometry was found
-           return stringid, nil, nil
+           return nil
         }
         centroid = computeCentroid(points)
         centroidType = "average"
@@ -687,12 +658,9 @@ func formatRelation(relation *osmpbf.Relation, context *context) (id string, val
     relation.Tags["_centroidType"] = centroidType;
 
     jRelation := jsonRelation{relation.ID, "relation", relation.Tags, centroid, bboxmin, bboxmax}
-    json, _ := json.Marshal(jRelation)
+    context.formattedRelations[relation.ID] = &jRelation
 
-    bufval.WriteString(string(json))
-    byteval := []byte(bufval.String())
-
-    return stringid, byteval, &jRelation
+    return &jRelation
 }
 
 func openFile(filename string) *os.File {
@@ -724,10 +692,9 @@ func openLevelDB(path string) *leveldb.DB {
 // }
 
 // check tags contain features from a whitelist
-func matchTagsAgainstCompulsoryTagList(tags map[string]string, tagList []string) bool {
-    for _, name := range tagList {
+func matchTagsAgainstCompulsoryTagList(tags map[string]string, tagList [][]string) bool {
+    for _, feature := range tagList {
 
-        feature := strings.Split(name, "~")
         foundVal, foundKey := tags[feature[0]]
 
         // key check
@@ -747,10 +714,10 @@ func matchTagsAgainstCompulsoryTagList(tags map[string]string, tagList []string)
 }
 
 // check tags contain features from a groups of whitelists
-func containsValidTags(tags map[string]string, group map[string][]string) (map[string]string,  bool) {
+func containsValidTags(tags map[string]string, groups map[int][][]string) (map[string]string,  bool) {
     if hasTags(tags) {
         tags = trimTags(tags)
-        for _, list := range group {
+        for _, list := range groups {
             if matchTagsAgainstCompulsoryTagList(tags, list) {
                return tags, true
             }
@@ -808,15 +775,12 @@ func translateAddress(tags map[string]string, location *Point, context *context)
                 }
 
             case osmpbf.RelationType:
-                if rel, ok := cacheFetch(context.relations, cid.ID).(*jsonRelation); ok {
+                if rel, ok := context.formattedRelations[cid.ID]; ok {
                     if !insideBBox(location, &rel.BBoxMin, &rel.BBoxMax) {
                         continue;
                     }
                     tags2 = rel.Tags
                 }
-
-            default:
-                log.Fatalf("Unexpected translation entity %d", cid.ID)
             }
 
             for k, v := range tags2 {
