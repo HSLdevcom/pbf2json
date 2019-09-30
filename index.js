@@ -45,6 +45,12 @@ function createReadStream( config ){
   // print error and exit on stderr
   proc.stderr.on( 'data', errorHandler( 'pbf2json' ) );
 
+  proc.on('close', function checkErr(code) {
+    if (code !== 0) {
+      process.exit(code);
+    }
+  });
+
   // terminate the process and pipeline
   decoder.kill = function(){
     proc.kill();
