@@ -18,6 +18,9 @@ import "github.com/paulmach/go.geo"
 
 const translateAddresses = true // disable if no multilang addresses are desired
 
+const streetHitDistance = 0.005 // in wgs coords, some hundreds of meters
+
+
 type Point struct {
     Lat  float64 `json:"lat"`
     Lon  float64 `json:"lon"`
@@ -89,6 +92,7 @@ type context struct {
     translations map[string][]cacheId
 
     config *settings
+    transcount int64
 }
 
 func getSettings() settings {
@@ -168,6 +172,7 @@ func (context *context) init() {
     context.dictionaryRelations = make(map[int64]bool)
 
     context.translations = make(map[string][]cacheId) // collected translation link map as name -> [cache references]
+    context.transcount = 0
 }
 
 
@@ -210,6 +215,8 @@ func main() {
 
     // output items that match tag selection
     outputValidEntries(&context)
+
+    // fmt.Printf("Translated address point count: %d\n", context.transcount)
 
     context.close()
 }
@@ -507,10 +514,10 @@ func sumBBox(bboxmin1, bboxmax1, bboxmin2, bboxmax2 *Point) {
 
 // test
 func insideBBox(p, bboxmin, bboxmax *Point) bool {
-     return p.Lat >= bboxmin.Lat &&
-            p.Lat <= bboxmax.Lat &&
-            p.Lon >= bboxmin.Lon &&
-            p.Lon <= bboxmax.Lon
+     return p.Lat >= bboxmin.Lat - streetHitDistance &&
+            p.Lat <= bboxmax.Lat + streetHitDistance &&
+            p.Lon >= bboxmin.Lon - streetHitDistance &&
+            p.Lon <= bboxmax.Lon + streetHitDistance
 }
 
 func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *jsonWay) {
@@ -792,6 +799,7 @@ func translateAddress(tags map[string]string, location *Point, context *context)
                         k2 := "addr:street:" + postfix // eg addr:street:sv
                         if _, ok = tags[k2]; !ok { // not yet used
                             tags[k2] = v
+                            context.transcount += 1
                         }
                     }
                 }
