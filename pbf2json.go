@@ -356,6 +356,13 @@ func createCache(d *osmpbf.Decoder, context *context) {
             }
         }
     }
+    if batch.Len() > 1 {
+       if prevtype == "node" {
+          cacheFlush(context.nodes, batch)
+       } else {
+          cacheFlush(context.ways, batch)
+       }
+    }
 }
 
 func outputValidEntries(context *context) {
