@@ -38,7 +38,7 @@ type jsonNode struct {
     Tags map[string]string `json:"tags"`
 }
 
-type jsonWay struct {
+type jsonWayRel struct {
     ID   int64             `json:"id"`
     Type string            `json:"type"`
     Tags map[string]string `json:"tags"`
@@ -46,16 +46,6 @@ type jsonWay struct {
     BBoxMin  Point         `json:"bbox_min"`
     BBoxMax  Point         `json:"bbox_max"`
 }
-
-type jsonRelation struct {
-    ID        int64               `json:"id"`
-    Type      string              `json:"type"`
-    Tags      map[string]string   `json:"tags"`
-    Centroid  Point               `json:"centroid"`
-    BBoxMin   Point               `json:"bbox_min"`
-    BBoxMax   Point               `json:"bbox_max"`
-}
-
 
 type cacheId struct {
     ID int64
@@ -79,7 +69,7 @@ type context struct {
 
     // put relations to memory resident map for quick access in resolving cross references
     relations map[int64]*osmpbf.Relation
-    formattedRelations map[int64]*jsonRelation
+    formattedRelations map[int64]*jsonWayRel
     pendingRelations map[int64]bool
 
     // items which are needed in translating address type items to multiple languages
@@ -162,7 +152,7 @@ func (context *context) init() {
     context.validRelations = make(map[int64]bool)
 
     context.relations = make(map[int64]*osmpbf.Relation)
-    context.formattedRelations = make(map[int64]*jsonRelation)
+    context.formattedRelations = make(map[int64]*jsonWayRel)
     context.pendingRelations = make(map[int64]bool) // resolve state map to stop infinite recursion
 
     context.dictionaryWays = make(map[int64]bool) // these ids may be needed for translation purposes
@@ -231,7 +221,7 @@ func collectRelationRefs(d *osmpbf.Decoder, context *context) {
 
             case *osmpbf.Relation:
                 tags, valid := containsValidTags(v.Tags, context.config.Tags)
-                toStreetDictionary(v.ID, osmpbf.RelationType, tags, context.dictionaryRelations, context.translations)
+                toStreetDictionary(v.ID, osmpbf.RelationType, tags, context.dictionaryRelations, context)
                 context.relations[v.ID] = v
                 if valid {
                     context.validRelations[v.ID] = true
@@ -265,7 +255,7 @@ func collectWayRefs(d *osmpbf.Decoder, context *context) {
 
             case *osmpbf.Way:
                 tags, ok := containsValidTags(v.Tags, context.config.Tags)
-                toDict := toStreetDictionary(v.ID, osmpbf.WayType, tags, context.dictionaryWays, context.translations)
+                toDict := toStreetDictionary(v.ID, osmpbf.WayType, tags, context.dictionaryWays, context)
                 if ok || toDict || context.wayRef[v.ID] == true {
                     for _, each := range v.NodeIDs {
                         context.nodeRef[each] = true
@@ -370,7 +360,7 @@ func outputValidEntries(context *context) {
         printJson(node)
     }
     for id, _ := range context.validWays {
-        way := cacheFetch(context.ways, id).(*jsonWay)
+        way := cacheFetch(context.ways, id).(*jsonWayRel)
         translateAddress(way.Tags, &way.Centroid, context)
         printJson(way)
     }
@@ -463,7 +453,7 @@ func cacheFetch(db *leveldb.DB, ID int64) interface{} {
        return &jNode
     }
     if nodetype == "way" {
-       jWay := jsonWay{}
+       jWay := jsonWayRel{}
        json.Unmarshal(data, &jWay)
        return &jWay
     }
@@ -524,7 +514,7 @@ func insideBBox(p, bboxmin, bboxmax *Point) bool {
             p.Lon <= bboxmax.Lon + streetHitDistance
 }
 
-func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *jsonWay) {
+func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *jsonWayRel) {
 
     stringid := strconv.FormatInt(way.ID, 10)
     var bufval bytes.Buffer
@@ -558,7 +548,7 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
         centroidType = "average"
     }
     way.Tags["_centroidType"] = centroidType;
-    jWay := jsonWay{way.ID, "way", way.Tags, centroid, bboxmin, bboxmax}
+    jWay := jsonWayRel{way.ID, "way", way.Tags, centroid, bboxmin, bboxmax}
     json, _ := json.Marshal(jWay)
 
     bufval.WriteString(string(json))
@@ -567,7 +557,7 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
     return stringid, byteval, &jWay
 }
 
-func formatRelation(relation *osmpbf.Relation, context *context) *jsonRelation {
+func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
 
     if _rel, ok := context.formattedRelations[relation.ID]; ok {
         return _rel // already done
@@ -612,7 +602,7 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonRelation {
             }
 
         case osmpbf.WayType:
-            if way, ok := cacheFetch(context.ways, each.ID).(*jsonWay); ok {
+            if way, ok := cacheFetch(context.ways, each.ID).(*jsonWayRel); ok {
                 if cType, ok := way.Tags["_centroidType"]; ok && cType != "average" {
                     if centroidType == "" || cType == "mainEntrance" {
                         centroid = way.Centroid
@@ -633,7 +623,7 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonRelation {
             }
 
         case osmpbf.RelationType:
-            var relation *jsonRelation
+            var relation *jsonWayRel
             relation = formatRelation(context.relations[each.ID], context) // recurse
             if relation == nil {
                 return nil
@@ -668,7 +658,7 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonRelation {
 
     relation.Tags["_centroidType"] = centroidType;
 
-    jRelation := jsonRelation{relation.ID, "relation", relation.Tags, centroid, bboxmin, bboxmax}
+    jRelation := jsonWayRel{relation.ID, "relation", relation.Tags, centroid, bboxmin, bboxmax}
     context.formattedRelations[relation.ID] = &jRelation
 
     return &jRelation
@@ -738,16 +728,18 @@ func containsValidTags(tags map[string]string, groups map[int][][]string) (map[s
 }
 
 // check if tags contain features which are useful for address translations
-func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]string, dictionaryIds map[int64]bool, dictionary map[string][]cacheId) bool {
+// also, group identially named streets
+func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]string, dictionaryIds map[int64]bool,  context *context) bool {
 
     if hasTags(tags) {
         if _, ok := tags["highway"]; ok {
             if name, ok2 := tags["name"]; ok2 {
+                cid := cacheId{ID, mtype}
+                context.streets[name] = append(context.streets[name], cid)
                 for k, v := range tags {
                     if strings.Contains(k, "name:") && v != name {
-                        cid := cacheId{ID, mtype}
                         dictionaryIds[ID] = true
-                        dictionary[name] = append(dictionary[name], cid)
+                        context.translations[name] = append(context.translations[name], cid)
                         return true
                     }
                 }
@@ -771,24 +763,24 @@ func translateAddress(tags map[string]string, location *Point, context *context)
 
     if translations, ok2 := context.translations[streetname]; ok2 {
         for _, cid := range translations {
+            var wr *jsonWayRel
+            var ok bool
+
             switch cid.Type {
+              case osmpbf.WayType:
+                wr, ok = cacheFetch(context.ways, cid.ID).(*jsonWayRel)
 
-            case osmpbf.WayType:
-                if way, ok := cacheFetch(context.ways, cid.ID).(*jsonWay); ok {
-                    if !insideBBox(location, &way.BBoxMin, &way.BBoxMax) {
-                        continue;
-                    }
-                    tags2 = way.Tags
-                }
-
-            case osmpbf.RelationType:
-                if rel, ok := context.formattedRelations[cid.ID]; ok {
-                    if !insideBBox(location, &rel.BBoxMin, &rel.BBoxMax) {
-                        continue;
-                    }
-                    tags2 = rel.Tags
-                }
+              case osmpbf.RelationType:
+                wr, ok = context.formattedRelations[cid.ID]
             }
+
+            if !ok {
+               continue
+            }
+            if !insideBBox(location, &wr.BBoxMin, &wr.BBoxMax) {
+               continue;
+            }
+            tags2 = wr.Tags
 
             for k, v := range tags2 {
                 if strings.HasPrefix(k, "name:") && streetname != v  {
