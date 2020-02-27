@@ -16,10 +16,7 @@ import "github.com/qedus/osmpbf"
 import "github.com/syndtr/goleveldb/leveldb"
 import "github.com/paulmach/go.geo"
 
-const translateAddresses = true // disable if no multilang addresses are desired
-
 const streetHitDistance = 0.005 // in wgs coords, some hundreds of meters
-
 
 type Point struct {
     Lat  float64 `json:"lat"`
@@ -743,7 +740,7 @@ func containsValidTags(tags map[string]string, groups map[int][][]string) (map[s
 // check if tags contain features which are useful for address translations
 func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]string, dictionaryIds map[int64]bool, dictionary map[string][]cacheId) bool {
 
-    if translateAddresses && hasTags(tags) {
+    if hasTags(tags) {
         if _, ok := tags["highway"]; ok {
             if name, ok2 := tags["name"]; ok2 {
                 for k, v := range tags {
@@ -761,10 +758,6 @@ func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]strin
 }
 
 func translateAddress(tags map[string]string, location *Point, context *context) {
-
-    if !translateAddresses {
-        return
-    }
     var streetname, housenumber string
     var ok bool
     if streetname, ok = tags["addr:street"]; !ok {
