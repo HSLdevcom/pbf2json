@@ -77,6 +77,8 @@ type context struct {
     dictionaryRelations map[int64]bool
 
     translations map[string][]cacheId
+    streets map[string][]cacheId
+    mergedStreets map[int64]*jsonWayRel
 
     config *settings
     transcount int64
@@ -160,6 +162,9 @@ func (context *context) init() {
 
     context.translations = make(map[string][]cacheId) // collected translation link map as name -> [cache references]
     context.transcount = 0
+
+    context.streets = make(map[string][]cacheId) // all streets collected here for merge process
+    context.mergedStreets = make(map[int64]*jsonWayRel)
 }
 
 
@@ -199,6 +204,9 @@ func main() {
     // pass 3: create cache for quick random access. Output matching items on the fly.
     decoder = createDecoder(context.file)
     createCache(decoder, &context)
+
+    // merge street segments
+    mergeStreets(&context)
 
     // output items that match tag selection
     outputValidEntries(&context)
@@ -361,13 +369,22 @@ func outputValidEntries(context *context) {
     }
     for id, _ := range context.validWays {
         way := cacheFetch(context.ways, id).(*jsonWayRel)
-        translateAddress(way.Tags, &way.Centroid, context)
-        printJson(way)
+        if _, ok := way.Tags["highway"]; !ok { // don't output street segments
+            translateAddress(way.Tags, &way.Centroid, context)
+            printJson(way)
+        }
     }
     for id, _ := range context.validRelations {
         relation := context.formattedRelations[id]
-        translateAddress(relation.Tags, &relation.Centroid, context)
-        printJson(relation)
+        if _, ok := relation.Tags["highway"]; !ok {
+           translateAddress(relation.Tags, &relation.Centroid, context)
+           printJson(relation)
+        }
+    }
+    for _, street := range context.mergedStreets {
+        if _, ok := containsValidTags(street.Tags, context.config.Tags) {
+           printJson(street)
+        }
     }
 }
 
@@ -512,6 +529,17 @@ func insideBBox(p, bboxmin, bboxmax *Point) bool {
             p.Lat <= bboxmax.Lat + streetHitDistance &&
             p.Lon >= bboxmin.Lon - streetHitDistance &&
             p.Lon <= bboxmax.Lon + streetHitDistance
+}
+
+// test
+func BBoxIntersects(bboxmin1, bboxmax1, bboxmin2, bboxmax2 *Point) bool {
+     if bboxmin1.Lat > bboxmax2.Lat + streetHitDistance ||
+        bboxmax1.Lat < bboxmin2.Lat - streetHitDistance ||
+        bboxmin1.Lon > bboxmax2.Lon + streetHitDistance ||
+        bboxmax1.Lon < bboxmin2.Lon - streetHitDistance {
+        return false
+     }
+     return true
 }
 
 func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *jsonWayRel) {
@@ -799,6 +827,66 @@ func translateAddress(tags map[string]string, location *Point, context *context)
         }
     }
 }
+
+
+// merge street segments into one
+func mergeStreets(context *context) {
+
+    for name, cids := range context.streets {
+       var current *street = nil
+       i1 := 0
+       i2 = len(cids) - 1
+       // iterate cids array until all connected sections are processed
+       // collect processed entries to the start of array. i1 points to first unfinished item
+       for ; i1 <= i2; {
+           var wr *jsonWayRel
+           var ok bool
+           added := false
+           for i := i1; i <= i2; i++ {
+             cid := cids[i];
+             switch cid.type {
+                case osmpbf.WayType:
+                    wr, ok = cacheFetch(context.ways, cid.ID).(*jsonWayRel)
+                case osmpbf.RelationType:
+                    wr, ok = context.formattedRelations[cid.ID]
+                default:
+                   ok = false
+             }
+             if ok {
+                if current == nil {
+                   current = wr
+                   context.mergedStreets[cid.ID]=wr
+                   i1++
+                } else {
+                   if BBoxIntersects(&wr.bboxmin, &wr.bboxmax, &current.way.bboxmin, &current.way.bboxmax) {
+                      added = true;
+                      sumBBox(&wr.bboxmin, &wr.bboxmax, &current.way.bboxmin, &current.way.bboxmax)
+                      // assign additional name tags
+                      for k, v := range wr.Tags {
+                          if strings.HasPrefix(k, "name:") {
+                             current.way.Tags[k] = v
+                          }
+                      }
+                      if i > i1 {
+                         // move unfinished item from start to current array index
+                         cids[i] = cids[i1]
+                      }
+                      i1++
+                   }
+                }
+             }
+           }
+           if !added {
+             if current != nil {
+                current = nil
+             } else {
+               break // nothing to add any more
+             }
+           }
+       }
+    }
+}
+
 
 // trim leading/trailing spaces from keys and values
 func trimTags(tags map[string]string) map[string]string {
