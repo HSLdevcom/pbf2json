@@ -382,7 +382,7 @@ func outputValidEntries(context *context) {
         }
     }
     for _, street := range context.mergedStreets {
-        if _, ok := containsValidTags(street.Tags, context.config.Tags) {
+        if _, ok := containsValidTags(street.Tags, context.config.Tags); ok {
            printJson(street)
         }
     }
@@ -445,7 +445,7 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way) (location Point, entranceTy
            // store found entrance but keep on looking for a main entrance
         }
     }
-    return foundLocation, eType;
+    return foundLocation, eType
 }
 
 func cacheFetch(db *leveldb.DB, ID int64) interface{} {
@@ -575,7 +575,7 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
         centroid = computeCentroid(points)
         centroidType = "average"
     }
-    way.Tags["_centroidType"] = centroidType;
+    way.Tags["_centroidType"] = centroidType
     jWay := jsonWayRel{way.ID, "way", way.Tags, centroid, bboxmin, bboxmax}
     json, _ := json.Marshal(jWay)
 
@@ -684,7 +684,7 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
         centroidType = "average"
     }
 
-    relation.Tags["_centroidType"] = centroidType;
+    relation.Tags["_centroidType"] = centroidType
 
     jRelation := jsonWayRel{relation.ID, "relation", relation.Tags, centroid, bboxmin, bboxmax}
     context.formattedRelations[relation.ID] = &jRelation
@@ -806,7 +806,7 @@ func translateAddress(tags map[string]string, location *Point, context *context)
                continue
             }
             if !insideBBox(location, &wr.BBoxMin, &wr.BBoxMax) {
-               continue;
+               continue
             }
             tags2 = wr.Tags
 
@@ -832,10 +832,10 @@ func translateAddress(tags map[string]string, location *Point, context *context)
 // merge street segments into one
 func mergeStreets(context *context) {
 
-    for name, cids := range context.streets {
-       var current *street = nil
+    for _, cids := range context.streets {
+       var current *jsonWayRel = nil
        i1 := 0
-       i2 = len(cids) - 1
+       i2 := len(cids) - 1
        // iterate cids array until all connected sections are processed
        // collect processed entries to the start of array. i1 points to first unfinished item
        for ; i1 <= i2; {
@@ -843,8 +843,8 @@ func mergeStreets(context *context) {
            var ok bool
            added := false
            for i := i1; i <= i2; i++ {
-             cid := cids[i];
-             switch cid.type {
+             cid := cids[i]
+             switch cid.Type {
                 case osmpbf.WayType:
                     wr, ok = cacheFetch(context.ways, cid.ID).(*jsonWayRel)
                 case osmpbf.RelationType:
@@ -858,13 +858,13 @@ func mergeStreets(context *context) {
                    context.mergedStreets[cid.ID]=wr
                    i1++
                 } else {
-                   if BBoxIntersects(&wr.bboxmin, &wr.bboxmax, &current.way.bboxmin, &current.way.bboxmax) {
-                      added = true;
-                      sumBBox(&wr.bboxmin, &wr.bboxmax, &current.way.bboxmin, &current.way.bboxmax)
+                   if BBoxIntersects(&wr.BBoxMin, &wr.BBoxMax, &current.BBoxMin, &current.BBoxMax) {
+                      added = true
+                      sumBBox(&wr.BBoxMin, &wr.BBoxMax, &current.BBoxMin, &current.BBoxMax)
                       // assign additional name tags
                       for k, v := range wr.Tags {
                           if strings.HasPrefix(k, "name:") {
-                             current.way.Tags[k] = v
+                             current.Tags[k] = v
                           }
                       }
                       if i > i1 {
