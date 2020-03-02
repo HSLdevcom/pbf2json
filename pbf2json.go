@@ -8,13 +8,14 @@ import "os"
 import "log"
 import "io"
 import "path/filepath"
-
+import "regexp"
 import "runtime"
 import "strings"
 import "strconv"
 import "github.com/qedus/osmpbf"
 import "github.com/syndtr/goleveldb/leveldb"
 import "github.com/paulmach/go.geo"
+// import "github.com/davecgh/go-spew/spew"
 
 const streetHitDistance = 0.005 // in wgs coords, some hundreds of meters
 
@@ -23,10 +24,21 @@ type Point struct {
     Lon  float64 `json:"lon"`
 }
 
+type TagValue struct {
+     values map[string]bool
+     regex string
+     any bool
+}
+
+type TagSelector struct {
+    tags map[string]*TagValue
+    regex map[string]*TagValue
+}
+
 type settings struct {
     PbfPath    string
     LevedbPath string
-    Tags       map[int][][]string
+    Tags map[int][]*TagSelector
     BatchSize  int
 }
 
@@ -89,7 +101,7 @@ func getSettings() settings {
     // command line flags
     leveldbPath := flag.String("leveldb", "/tmp", "path to leveldb directory")
 
-    tagList := flag.String("tags", "", "comma-separated list of valid tags, group AND conditions with a +")
+    tagList := flag.String("tags", "", "comma-separated list of valid tags, group AND conditions with a §")
     batchSize := flag.Int("batch", 50000, "batch leveldb writes in batches of this size")
 
     flag.Parse()
@@ -105,14 +117,41 @@ func getSettings() settings {
     }
 
     // parse tag conditions
-    conditions := make(map[int][][]string)
-    for i, group := range strings.Split(*tagList, ",") {
-        for _, keyval := range strings.Split(group, "+") {
-            conditions[i] = append(conditions[i], strings.Split(keyval, "~"))
+    groups := make(map[int][]*TagSelector)
+    for i, group := range strings.Split(*tagList, ",") { // top level alternatives
+        for _, conditions := range strings.Split(group, "§") { // AND combined conditions for a single alternative
+            condition := &TagSelector{make(map[string]*TagValue), make(map[string]*TagValue)}
+            for _, tag := range strings.Split(conditions, "!") { // tag alternatives, combined with OR
+                tv := TagValue{make(map[string]bool), "", false}
+                pair := strings.Split(tag, "~") // tag name + optional value(s)
+                if len(pair) > 1 {
+                   valueDef := pair[1];
+                   p1 := strings.LastIndex(valueDef, "#") // regex?
+                   if p1 >= 0 {
+                      tv.regex = valueDef[p1+1:]
+                   } else {
+                      for _, val := range strings.Split(valueDef, ";") {
+                          tv.values[val] = true;
+                      }
+                   }
+                } else {
+                   tv.any = true
+                }
+                tname := pair[0];
+                // check regex
+                pos := strings.LastIndex(tname, "#")
+                if pos >= 0 {
+                    condition.regex[tname[pos+1:]] = &tv;
+                } else {
+                    condition.tags[tname] = &tv;
+                }
+            }
+            groups[i] = append(groups[i], condition)
         }
     }
+    // spew.Dump(groups)
 
-    return settings{args[0], *leveldbPath, conditions, *batchSize}
+    return settings{args[0], *leveldbPath, groups, *batchSize}
 }
 
 func createDecoder(file *os.File) *osmpbf.Decoder {
@@ -351,7 +390,7 @@ func createCache(d *osmpbf.Decoder, context *context) {
             }
         }
     }
-    if batch.Len() > 1 {
+    if batch.Len() > 0 {
        if prevtype == "node" {
           cacheFlush(context.nodes, batch)
        } else {
@@ -714,36 +753,54 @@ func openLevelDB(path string) *leveldb.DB {
     return db
 }
 
-// extract all keys to array
-// keys := []string{}
-// for k := range v.Tags {
-//     keys = append(keys, k)
-// }
+
+func testTagVal(val string, tv *TagValue) bool {
+     if tv.any == true {
+           return true
+     }
+     if _, ok :=  tv.values[val]; ok {
+           return true
+     }
+     if tv.regex != "" {
+           if match, _ := regexp.MatchString(tv.regex, val); match {
+               return true
+           }
+     }
+     return false
+}
+
 
 // check tags contain features from a whitelist
-func matchTagsAgainstCompulsoryTagList(tags map[string]string, tagList [][]string) bool {
-    for _, feature := range tagList {
+func matchTagsAgainstCompulsoryTagList(tags map[string]string, compulsory []*TagSelector) bool {
 
-        foundVal, foundKey := tags[feature[0]]
-
-        // key check
-        if !foundKey {
-            return false
-        }
-
-        // value check
-        if len(feature) > 1 {
-            if foundVal != feature[1] {
-                return false
-            }
-        }
+     // must satisfy - all - conditions of compulsory
+     for _, cond := range compulsory {
+           found := false
+           for tag, val := range tags {
+               if tv, ok := cond.tags[tag]; ok {
+                  if testTagVal(val, tv) {
+                     found = true
+                     break
+                  }
+               }
+               for regex, tv := range cond.regex {
+                   if match, _ := regexp.MatchString(regex, tag); match {
+                       if testTagVal(val, tv) {
+                         found = true
+                         break
+                       }
+                   }
+               }
+           }
+           if found == false {
+              return false
+           }
     }
-
     return true
 }
 
 // check tags contain features from a groups of whitelists
-func containsValidTags(tags map[string]string, groups map[int][][]string) (map[string]string,  bool) {
+func containsValidTags(tags map[string]string, groups map[int][]*TagSelector) (map[string]string,  bool) {
     if hasTags(tags) {
         tags = trimTags(tags)
         for _, list := range groups {
