@@ -40,6 +40,7 @@ type settings struct {
     LevedbPath string
     Tags map[int][]*TagSelector
     BatchSize  int
+    names map[string]bool
 }
 
 type jsonNode struct {
@@ -103,6 +104,7 @@ func getSettings() settings {
 
     tagList := flag.String("tags", "", "comma-separated list of valid tags, group AND conditions with a §")
     batchSize := flag.Int("batch", 50000, "batch leveldb writes in batches of this size")
+    names := flag.String("names", "name", "comma-separated list of supported names")
 
     flag.Parse()
     args := flag.Args()
@@ -151,7 +153,11 @@ func getSettings() settings {
     }
     // spew.Dump(groups)
 
-    return settings{args[0], *leveldbPath, groups, *batchSize}
+    nameMap := make(map[string]bool)
+    for _, name := range strings.Split(*names, ",") {
+        nameMap[name] = true
+    }
+    return settings{args[0], *leveldbPath, groups, *batchSize, nameMap}
 }
 
 func createDecoder(file *os.File) *osmpbf.Decoder {
@@ -822,11 +828,13 @@ func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]strin
                 cid := cacheId{ID, mtype}
                 context.streets[name] = append(context.streets[name], cid)
                 for k, v := range tags {
-                    if strings.Contains(k, "name:") && v != name {
+                  for namekey, _ := range context.config.names {
+                    if strings.Contains(k, namekey) && v != name {
                         dictionaryIds[ID] = true
                         context.translations[name] = append(context.translations[name], cid)
                         return true
                     }
+                  }
                 }
             }
         }
@@ -868,18 +876,24 @@ func translateAddress(tags map[string]string, location *Point, context *context)
             tags2 = wr.Tags
 
             for k, v := range tags2 {
-                if strings.HasPrefix(k, "name:") && streetname != v  {
-                    if _, ok = tags[k]; false && !ok { // name:lang entry not yet in use
-                       tags[k] = housenumber + " " + v // Hooray! Translated!
-                    } else {
-                        postfix := strings.TrimPrefix(k, "name:")
-                        k2 := "addr:street:" + postfix // eg addr:street:sv
-                        if _, ok = tags[k2]; !ok { // not yet used
-                            tags[k2] = v
-                            context.transcount += 1
-                        }
+              if streetname != v  { // new kind of name
+                if strings.HasPrefix(k, "name:") { // language version
+                    postfix := strings.TrimPrefix(k, "name:")
+                    k2 := "addr:street:" + postfix // eg addr:street:sv
+                    if _, ok = tags[k2]; !ok { // not yet used
+                        tags[k2] = v
+                        context.transcount += 1
                     }
+                } else { // check for alt names, including xxx_name:lang
+                  for namekey, _ := range context.config.names {
+                    if strings.Contains(k, namekey) && !strings.Contains(v, housenumber)  {
+                       if _, ok = tags[k]; !ok { // alternative name not yet in use
+                          tags[namekey] = v + " " + housenumber // new translation
+                       }
+                    }
+                  }
                 }
+              }
             }
         }
     }
