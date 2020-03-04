@@ -632,6 +632,9 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
 
 func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
 
+    if relation == nil {
+       return nil;
+    }
     if _rel, ok := context.formattedRelations[relation.ID]; ok {
         return _rel // already done
     }
@@ -699,7 +702,7 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
             var relation *jsonWayRel
             relation = formatRelation(context.relations[each.ID], context) // recurse
             if relation == nil {
-                return nil
+                continue
             }
 
             if cType, ok := relation.Tags["_centroidType"]; ok && cType != "average" {
