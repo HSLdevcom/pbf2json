@@ -15,7 +15,7 @@ import "strconv"
 import "github.com/qedus/osmpbf"
 import "github.com/syndtr/goleveldb/leveldb"
 import "github.com/paulmach/go.geo"
-// import "github.com/davecgh/go-spew/spew"
+//import "github.com/davecgh/go-spew/spew"
 
 const streetHitDistance = 0.005 // in wgs coords, some hundreds of meters
 
@@ -26,13 +26,18 @@ type Point struct {
 
 type TagValue struct {
      values map[string]bool
-     regex string
+     regex *regexp.Regexp
      any bool
+}
+
+type TagExp struct {
+     regex *regexp.Regexp
+     value *TagValue
 }
 
 type TagSelector struct {
     tags map[string]*TagValue
-    regex map[string]*TagValue
+    tagex []TagExp
 }
 
 type settings struct {
@@ -41,6 +46,7 @@ type settings struct {
     Tags map[int][]*TagSelector
     BatchSize  int
     names map[string]bool
+    highways map[string]bool
 }
 
 type jsonNode struct {
@@ -105,6 +111,7 @@ func getSettings() settings {
     tagList := flag.String("tags", "", "comma-separated list of valid tags, group AND conditions with a §")
     batchSize := flag.Int("batch", 50000, "batch leveldb writes in batches of this size")
     names := flag.String("names", "name", "comma-separated list of supported names")
+    highways := flag.String("highways", "", "comma-separated list of supported highway values")
 
     flag.Parse()
     args := flag.Args()
@@ -122,15 +129,15 @@ func getSettings() settings {
     groups := make(map[int][]*TagSelector)
     for i, group := range strings.Split(*tagList, ",") { // top level alternatives
         for _, conditions := range strings.Split(group, "§") { // AND combined conditions for a single alternative
-            condition := &TagSelector{make(map[string]*TagValue), make(map[string]*TagValue)}
+            condition := &TagSelector{make(map[string]*TagValue), make([]TagExp, 0)}
             for _, tag := range strings.Split(conditions, "!") { // tag alternatives, combined with OR
-                tv := TagValue{make(map[string]bool), "", false}
+                tv := TagValue{make(map[string]bool), nil, false}
                 pair := strings.Split(tag, "~") // tag name + optional value(s)
                 if len(pair) > 1 {
                    valueDef := pair[1];
                    p1 := strings.LastIndex(valueDef, "#") // regex?
                    if p1 >= 0 {
-                      tv.regex = valueDef[p1+1:]
+                      tv.regex = regexp.MustCompile(valueDef[p1+1:])
                    } else {
                       for _, val := range strings.Split(valueDef, ";") {
                           tv.values[val] = true;
@@ -143,7 +150,7 @@ func getSettings() settings {
                 // check regex
                 pos := strings.LastIndex(tname, "#")
                 if pos >= 0 {
-                    condition.regex[tname[pos+1:]] = &tv;
+                    condition.tagex = append(condition.tagex, TagExp{regexp.MustCompile(tname[pos+1:]), &tv})
                 } else {
                     condition.tags[tname] = &tv;
                 }
@@ -151,13 +158,21 @@ func getSettings() settings {
             groups[i] = append(groups[i], condition)
         }
     }
-    // spew.Dump(groups)
+    //spew.Dump(groups)
 
     nameMap := make(map[string]bool)
     for _, name := range strings.Split(*names, ",") {
         nameMap[name] = true
     }
-    return settings{args[0], *leveldbPath, groups, *batchSize, nameMap}
+
+    var hwMap map[string]bool
+    if *highways != "" {
+       hwMap := make(map[string]bool)
+       for _, val := range strings.Split(*highways, ",") {
+           hwMap[val] = true
+       }
+    }
+    return settings{args[0], *leveldbPath, groups, *batchSize, nameMap, hwMap}
 }
 
 func createDecoder(file *os.File) *osmpbf.Decoder {
@@ -770,10 +785,8 @@ func testTagVal(val string, tv *TagValue) bool {
      if _, ok :=  tv.values[val]; ok {
            return true
      }
-     if tv.regex != "" {
-           if match, _ := regexp.MatchString(tv.regex, val); match {
-               return true
-           }
+     if tv.regex != nil {
+           return tv.regex.MatchString(val)
      }
      return false
 }
@@ -792,9 +805,9 @@ func matchTagsAgainstCompulsoryTagList(tags map[string]string, compulsory []*Tag
                      break
                   }
                }
-               for regex, tv := range cond.regex {
-                   if match, _ := regexp.MatchString(regex, tag); match {
-                       if testTagVal(val, tv) {
+               for _, tagex := range cond.tagex {
+                   if tagex.regex.MatchString(tag) {
+                       if testTagVal(val, tagex.value) {
                          found = true
                          break
                        }
@@ -826,13 +839,19 @@ func containsValidTags(tags map[string]string, groups map[int][]*TagSelector) (m
 func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]string, dictionaryIds map[int64]bool,  context *context) bool {
 
     if hasTags(tags) {
-        if _, ok := tags["highway"]; ok {
+        if htype, ok := tags["highway"]; ok {
+            if (context.config.highways != nil) {
+               // highway type filter given, validate against allowed values
+               if _, validHWtype := context.config.highways[htype]; !validHWtype {
+                  return false
+               }
+            }
             if name, ok2 := tags["name"]; ok2 {
                 cid := cacheId{ID, mtype}
                 context.streets[name] = append(context.streets[name], cid)
                 for k, v := range tags {
                   for namekey, _ := range context.config.names {
-                    if strings.Contains(k, namekey) && v != name {
+                    if strings.HasPrefix(k, namekey) && v != name {
                         dictionaryIds[ID] = true
                         context.translations[name] = append(context.translations[name], cid)
                         return true
@@ -889,7 +908,7 @@ func translateAddress(tags map[string]string, location *Point, context *context)
                     }
                 } else { // check for alt names, including xxx_name:lang
                   for namekey, _ := range context.config.names {
-                    if strings.Contains(k, namekey) && !strings.Contains(v, housenumber)  {
+                    if strings.HasPrefix(k, namekey) && !strings.Contains(v, housenumber)  {
                        if _, ok = tags[k]; !ok { // alternative name not yet in use
                           tags[namekey] = v + " " + housenumber // new translation
                        }
