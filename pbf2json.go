@@ -927,14 +927,19 @@ func translateAddress(tags map[string]string, location *Point, context *context)
                     postfix := strings.TrimPrefix(k, "name:")
                     k2 := "addr:street:" + postfix // eg addr:street:sv
                     if _, ok = tags[k2]; !ok { // not yet used
-                        tags[k2] = v
+                        tags[k2] = v // new translation
                         context.transcount += 1
                     }
                 } else { // check for alt names, including xxx_name:lang
                   for namekey, _ := range context.config.names {
                     if strings.HasPrefix(k, namekey) && !strings.Contains(v, housenumber)  {
-                       if _, ok = tags[k]; !ok { // alternative name not yet in use
-                          tags[namekey] = v + " " + housenumber // new translation
+                       // this is a trick to pass unsupported streetname versions to pelias model
+                       // we mark alternative names as addr:street:<alt_name>, eg.addr:street:short_name
+                       // osm importer tracks such names and indexes them properly
+                       k2 := "addr:street:" + namekey
+                       if _, ok = tags[k2]; !ok {
+                          tags[k2] = v
+                          context.transcount += 1
                        }
                     }
                   }
