@@ -429,22 +429,34 @@ func outputValidEntries(context *context) {
     }
     for id, _ := range context.validWays {
         way := cacheFetch(context.ways, id).(*jsonWayRel)
-        if _, ok := way.Tags["highway"]; !ok { // don't output street segments
-            translateAddress(way.Tags, &way.Centroid, context)
-            printJson(way)
+        if _, ok := way.Tags["highway"]; ok { // streets are outputted separately
+            if _, s := context.mergedStreets[id]; s {
+               continue
+            }
+            if highwayOnly(way.Tags, context.config.Tags) {
+               logJson(way)
+               continue
+            }
         }
+        translateAddress(way.Tags, &way.Centroid, context)
+        printJson(way)
     }
     for id, _ := range context.validRelations {
         relation := context.formattedRelations[id]
-        if _, ok := relation.Tags["highway"]; !ok {
-           translateAddress(relation.Tags, &relation.Centroid, context)
-           printJson(relation)
+        if _, ok := relation.Tags["highway"]; ok {
+            if _, s := context.mergedStreets[id]; s {
+               continue
+            }
+            if highwayOnly(relation.Tags, context.config.Tags) {
+               logJson(relation)
+               continue
+            }
         }
+        translateAddress(relation.Tags, &relation.Centroid, context)
+        printJson(relation)
     }
     for _, street := range context.mergedStreets {
-        if _, ok := containsValidTags(street.Tags, context.config.Tags); ok {
-           printJson(street)
-        }
+        printJson(street)
     }
 }
 
@@ -832,6 +844,18 @@ func containsValidTags(tags map[string]string, groups map[int][]*TagSelector) (m
         }
     }
     return tags, false
+}
+
+
+func highwayOnly(tags map[string]string, groups map[int][]*TagSelector) bool {
+    delete(tags, "highway") // remove examined property
+    // check if target is interesting because of other tags
+    for _, list := range groups {
+        if matchTagsAgainstCompulsoryTagList(tags, list) {
+            return false
+        }
+    }
+    return true
 }
 
 // check if tags contain features which are useful for address translations
