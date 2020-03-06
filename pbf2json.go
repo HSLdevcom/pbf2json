@@ -18,6 +18,7 @@ import "github.com/paulmach/go.geo"
 //import "github.com/davecgh/go-spew/spew"
 
 const streetHitDistance = 0.005 // in wgs coords, some hundreds of meters
+var isAddrRef = regexp.MustCompile(`^[a-zA-Z]{1}([1-9])?$`).MatchString
 
 type Point struct {
     Lat  float64 `json:"lat"`
@@ -71,6 +72,8 @@ type cacheId struct {
     Type osmpbf.MemberType
 }
 
+var pbflog, _  = os.Create("/tmp/pbflog")
+
 type context struct {
     file *os.File
 
@@ -99,6 +102,8 @@ type context struct {
     streets map[string][]cacheId
     mergedStreets map[int64]*jsonWayRel
 
+    entrances map[int64]*jsonNode // accurate address points generated runtime
+
     config *settings
     transcount int64
 }
@@ -124,6 +129,8 @@ func getSettings() settings {
     if len(*tagList) < 1 {
         log.Fatal("Nothing to do, you must specify tags to match against")
     }
+
+    pbflog.WriteString(*tagList + "\n");
 
     // parse tag conditions
     groups := make(map[int][]*TagSelector)
@@ -164,6 +171,7 @@ func getSettings() settings {
     for _, name := range strings.Split(*names, ",") {
         nameMap[name] = true
     }
+    pbflog.WriteString(*names+ "\n");
 
     var hwMap map[string]bool
     if *highways != "" {
@@ -171,6 +179,7 @@ func getSettings() settings {
        for _, val := range strings.Split(*highways, ",") {
            hwMap[val] = true
        }
+       pbflog.WriteString(*highways + "\n");
     }
     return settings{args[0], *leveldbPath, groups, *batchSize, nameMap, hwMap}
 }
@@ -225,6 +234,7 @@ func (context *context) init() {
 
     context.streets = make(map[string][]cacheId) // all streets collected here for merge process
     context.mergedStreets = make(map[int64]*jsonWayRel)
+    context.entrances = make(map[int64]*jsonNode)
 }
 
 
@@ -238,7 +248,7 @@ func (context *context) close() {
     if context.file != nil {
        context.file.Close()
     }
-
+    pbflog.Close()
     os.RemoveAll(context.config.LevedbPath)
 }
 
@@ -271,7 +281,7 @@ func main() {
     // output items that match tag selection
     outputValidEntries(&context)
 
-    // fmt.Printf("Translated address point count: %d\n", context.transcount)
+    fmt.Fprintf(pbflog, "Translated address point count: %d\n", context.transcount)
 
     context.close()
 }
@@ -332,7 +342,7 @@ func collectWayRefs(d *osmpbf.Decoder, context *context) {
             }
         }
     }
-    // fmt.Printf("Dictionary size %d\n", len(context.translations))
+    fmt.Fprintf(pbflog, "Dictionary size %d\n", len(context.translations))
 }
 
 func createCache(d *osmpbf.Decoder, context *context) {
@@ -434,7 +444,6 @@ func outputValidEntries(context *context) {
                continue
             }
             if highwayOnly(way.Tags, context.config.Tags) {
-               logJson(way)
                continue
             }
         }
@@ -448,7 +457,6 @@ func outputValidEntries(context *context) {
                continue
             }
             if highwayOnly(relation.Tags, context.config.Tags) {
-               logJson(relation)
                continue
             }
         }
@@ -458,12 +466,21 @@ func outputValidEntries(context *context) {
     for _, street := range context.mergedStreets {
         printJson(street)
     }
+    for _, entrance := range context.entrances {
+        printJson(entrance)
+        logJson(entrance)
+    }
 }
 
 
 func printJson(v interface{}) {
     json, _ := json.Marshal(v)
     fmt.Println(string(json))
+}
+
+func logJson(v interface{}) {
+    json, _ := json.Marshal(v)
+    pbflog.WriteString(string(json)+"\n")
 }
 
 
@@ -496,25 +513,51 @@ func collectPoints(db *leveldb.DB, way *osmpbf.Way) ([]Point) {
     return container
 }
 
-func entranceLookup(db *leveldb.DB, way *osmpbf.Way) (location Point, entranceType string) {
+func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber string, context *context) (location Point, entranceType string) {
      var foundLocation Point
      eType := ""
 
      for _, each := range way.NodeIDs {
         node, ok := cacheFetch(db, each).(*jsonNode)
         if !ok {
-           return location, eType // bad reference, skip
+           continue
         }
 
         val, _type := entranceLocation(node)
 
-        if _type == "mainEntrance" {
-            return val, _type // use first detected main entrance
+        if _type == "" {
+           continue
         }
-        if _type == "entrance" {
-           foundLocation = val
-           eType = _type
-           // store found entrance but keep on looking for a main entrance
+        if _type == "mainEntrance" {
+            foundLocation = val
+            eType = _type
+            if street == "" { // no need to parse all entrances
+                return val, _type // use first detected main entrance
+            }
+        } else {
+            if (eType != "mainEntrance") { // don't overrule main entrance by minor entrance
+               // store found entrance but keep on looking for a main entrance
+               foundLocation = val
+               eType = _type
+            }
+        }
+        if street != "" {
+            ref, hasRef := node.Tags["ref"]
+            _, hasStreet := node.Tags["addr:street"]
+            _, hasNumber := node.Tags["addr:housenumber"]
+            if hasRef && !(hasNumber && hasStreet) { // would not be outputted as an address
+               ref = strings.TrimSpace(ref)
+               if len(ref) > 2 {
+                  if ref[2:3] == " " {
+                     ref = strings.TrimSpace(ref[0:2])
+                  }
+               }
+               if isAddrRef(ref) {
+                  node.Tags["addr:street"] = street // add missing addr info
+                  node.Tags["addr:housenumber"] = housenumber
+                  context.entrances[node.ID] = node
+               }
+            }
         }
     }
     return foundLocation, eType
@@ -621,6 +664,12 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
 
     // special treatment for buildings
     _, isBuilding := way.Tags["building"]
+    street, hasStreet := way.Tags["addr:street"]
+    houseNumber, hasHouseNumber := way.Tags["addr:housenumber"]
+    hasAddress := hasStreet && hasHouseNumber
+    if !hasAddress {
+       street = ""
+    }
 
     // lookup from leveldb
     points := collectPoints(context.nodes, way)
@@ -639,8 +688,8 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
 
     var centroid Point
     var centroidType string
-    if isBuilding {
-        centroid, centroidType = entranceLookup(context.nodes, way)
+    if isBuilding || hasAddress {
+        centroid, centroidType = entranceLookup(context.nodes, way, street, houseNumber, context)
     }
 
     if centroidType == "" {
@@ -1061,7 +1110,7 @@ func entranceLocation(node *jsonNode) (location Point, entranceType string) {
         if val == "main" {
             return Point{Lat: node.Lat, Lon: node.Lon}, "mainEntrance"
         }
-        if val == "yes" {
+        if val == "yes" || val == "staircase" || val == "home" {
            return Point{Lat: node.Lat, Lon: node.Lon}, "entrance"
         }
     }
