@@ -72,7 +72,7 @@ type cacheId struct {
     Type osmpbf.MemberType
 }
 
-var pbflog, _  = os.Create("/tmp/pbflog")
+// var pbflog, _  = os.Create("/tmp/pbflog")
 
 type context struct {
     file *os.File
@@ -130,7 +130,7 @@ func getSettings() settings {
         log.Fatal("Nothing to do, you must specify tags to match against")
     }
 
-    pbflog.WriteString(*tagList + "\n");
+    // pbflog.WriteString(*tagList + "\n");
 
     // parse tag conditions
     groups := make(map[int][]*TagSelector)
@@ -171,7 +171,7 @@ func getSettings() settings {
     for _, name := range strings.Split(*names, ",") {
         nameMap[name] = true
     }
-    pbflog.WriteString(*names+ "\n");
+    // pbflog.WriteString(*names+ "\n");
 
     var hwMap map[string]bool
     if *highways != "" {
@@ -179,7 +179,7 @@ func getSettings() settings {
        for _, val := range strings.Split(*highways, ",") {
            hwMap[val] = true
        }
-       pbflog.WriteString(*highways + "\n");
+       // pbflog.WriteString(*highways + "\n");
     }
     return settings{args[0], *leveldbPath, groups, *batchSize, nameMap, hwMap}
 }
@@ -248,7 +248,7 @@ func (context *context) close() {
     if context.file != nil {
        context.file.Close()
     }
-    pbflog.Close()
+    // pbflog.Close()
     os.RemoveAll(context.config.LevedbPath)
 }
 
@@ -281,7 +281,7 @@ func main() {
     // output items that match tag selection
     outputValidEntries(&context)
 
-    fmt.Fprintf(pbflog, "Translated address point count: %d\n", context.transcount)
+    // fmt.Fprintf(pbflog, "Translated address point count: %d\n", context.transcount)
 
     context.close()
 }
@@ -342,7 +342,7 @@ func collectWayRefs(d *osmpbf.Decoder, context *context) {
             }
         }
     }
-    fmt.Fprintf(pbflog, "Dictionary size %d\n", len(context.translations))
+    // fmt.Fprintf(pbflog, "Dictionary size %d\n", len(context.translations))
 }
 
 func createCache(d *osmpbf.Decoder, context *context) {
@@ -468,7 +468,7 @@ func outputValidEntries(context *context) {
     }
     for _, entrance := range context.entrances {
         printJson(entrance)
-        logJson(entrance)
+        // logJson(entrance)
     }
 }
 
@@ -478,11 +478,12 @@ func printJson(v interface{}) {
     fmt.Println(string(json))
 }
 
+/*
 func logJson(v interface{}) {
     json, _ := json.Marshal(v)
     pbflog.WriteString(string(json)+"\n")
 }
-
+*/
 
 // queue a leveldb write in a batch
 func cacheQueue(batch *leveldb.Batch, id string, val []byte) {
