@@ -544,6 +544,10 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber 
         }
         if street != "" {
             ref, hasRef := node.Tags["ref"]
+
+            if !hasRef { //  this is suspious. Unit means apartment, not staircase! Anyway, we validate the value below.
+               ref, hasRef = node.Tags["addr:unit"]
+            }
             _, hasStreet := node.Tags["addr:street"]
             _, hasNumber := node.Tags["addr:housenumber"]
             if hasRef && !(hasNumber && hasStreet) { // would not be outputted as an address
@@ -556,6 +560,7 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber 
                if isAddrRef(ref) {
                   node.Tags["addr:street"] = street // add missing addr info
                   node.Tags["addr:housenumber"] = housenumber
+                  node.Tags["addr:unit"] = ref // use addr:unit to pass staircase/entrance
                   context.entrances[node.ID] = node
                }
             }
