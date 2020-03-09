@@ -8,29 +8,46 @@ import "os"
 import "log"
 import "io"
 import "path/filepath"
-
+import "regexp"
 import "runtime"
 import "strings"
 import "strconv"
 import "github.com/qedus/osmpbf"
 import "github.com/syndtr/goleveldb/leveldb"
 import "github.com/paulmach/go.geo"
-
-const translateAddresses = true // disable if no multilang addresses are desired
+//import "github.com/davecgh/go-spew/spew"
 
 const streetHitDistance = 0.005 // in wgs coords, some hundreds of meters
-
+var isAddrRef = regexp.MustCompile(`^[a-zA-Z]{1}([1-9])?$`).MatchString
 
 type Point struct {
     Lat  float64 `json:"lat"`
     Lon  float64 `json:"lon"`
 }
 
+type TagValue struct {
+     values map[string]bool
+     regex *regexp.Regexp
+     any bool
+}
+
+type TagExp struct {
+     regex *regexp.Regexp
+     value *TagValue
+}
+
+type TagSelector struct {
+    tags map[string]*TagValue
+    tagex []TagExp
+}
+
 type settings struct {
     PbfPath    string
     LevedbPath string
-    Tags       map[int][][]string
+    Tags map[int][]*TagSelector
     BatchSize  int
+    names map[string]bool
+    highways map[string]bool
 }
 
 type jsonNode struct {
@@ -41,7 +58,7 @@ type jsonNode struct {
     Tags map[string]string `json:"tags"`
 }
 
-type jsonWay struct {
+type jsonWayRel struct {
     ID   int64             `json:"id"`
     Type string            `json:"type"`
     Tags map[string]string `json:"tags"`
@@ -50,20 +67,12 @@ type jsonWay struct {
     BBoxMax  Point         `json:"bbox_max"`
 }
 
-type jsonRelation struct {
-    ID        int64               `json:"id"`
-    Type      string              `json:"type"`
-    Tags      map[string]string   `json:"tags"`
-    Centroid  Point               `json:"centroid"`
-    BBoxMin   Point               `json:"bbox_min"`
-    BBoxMax   Point               `json:"bbox_max"`
-}
-
-
 type cacheId struct {
     ID int64
     Type osmpbf.MemberType
 }
+
+// var pbflog, _  = os.Create("/tmp/pbflog")
 
 type context struct {
     file *os.File
@@ -82,7 +91,7 @@ type context struct {
 
     // put relations to memory resident map for quick access in resolving cross references
     relations map[int64]*osmpbf.Relation
-    formattedRelations map[int64]*jsonRelation
+    formattedRelations map[int64]*jsonWayRel
     pendingRelations map[int64]bool
 
     // items which are needed in translating address type items to multiple languages
@@ -90,6 +99,10 @@ type context struct {
     dictionaryRelations map[int64]bool
 
     translations map[string][]cacheId
+    streets map[string][]cacheId
+    mergedStreets map[int64]*jsonWayRel
+
+    entrances map[int64]*jsonNode // accurate address points generated runtime
 
     config *settings
     transcount int64
@@ -100,8 +113,10 @@ func getSettings() settings {
     // command line flags
     leveldbPath := flag.String("leveldb", "/tmp", "path to leveldb directory")
 
-    tagList := flag.String("tags", "", "comma-separated list of valid tags, group AND conditions with a +")
+    tagList := flag.String("tags", "", "comma-separated list of valid tags, group AND conditions with a §")
     batchSize := flag.Int("batch", 50000, "batch leveldb writes in batches of this size")
+    names := flag.String("names", "name", "comma-separated list of supported names")
+    highways := flag.String("highways", "", "comma-separated list of supported highway values")
 
     flag.Parse()
     args := flag.Args()
@@ -115,15 +130,58 @@ func getSettings() settings {
         log.Fatal("Nothing to do, you must specify tags to match against")
     }
 
+    // pbflog.WriteString(*tagList + "\n");
+
     // parse tag conditions
-    conditions := make(map[int][][]string)
-    for i, group := range strings.Split(*tagList, ",") {
-        for _, keyval := range strings.Split(group, "+") {
-            conditions[i] = append(conditions[i], strings.Split(keyval, "~"))
+    groups := make(map[int][]*TagSelector)
+    for i, group := range strings.Split(*tagList, ",") { // top level alternatives
+        for _, conditions := range strings.Split(group, "§") { // AND combined conditions for a single alternative
+            condition := &TagSelector{make(map[string]*TagValue), make([]TagExp, 0)}
+            for _, tag := range strings.Split(conditions, "!") { // tag alternatives, combined with OR
+                tv := TagValue{make(map[string]bool), nil, false}
+                pair := strings.Split(tag, "~") // tag name + optional value(s)
+                if len(pair) > 1 {
+                   valueDef := pair[1];
+                   p1 := strings.LastIndex(valueDef, "#") // regex?
+                   if p1 >= 0 {
+                      tv.regex = regexp.MustCompile(valueDef[p1+1:])
+                   } else {
+                      for _, val := range strings.Split(valueDef, ";") {
+                          tv.values[val] = true;
+                      }
+                   }
+                } else {
+                   tv.any = true
+                }
+                tname := pair[0];
+                // check regex
+                pos := strings.LastIndex(tname, "#")
+                if pos >= 0 {
+                    condition.tagex = append(condition.tagex, TagExp{regexp.MustCompile(tname[pos+1:]), &tv})
+                } else {
+                    condition.tags[tname] = &tv;
+                }
+            }
+            groups[i] = append(groups[i], condition)
         }
     }
+    //spew.Dump(groups)
 
-    return settings{args[0], *leveldbPath, conditions, *batchSize}
+    nameMap := make(map[string]bool)
+    for _, name := range strings.Split(*names, ",") {
+        nameMap[name] = true
+    }
+    // pbflog.WriteString(*names+ "\n");
+
+    var hwMap map[string]bool
+    if *highways != "" {
+       hwMap := make(map[string]bool)
+       for _, val := range strings.Split(*highways, ",") {
+           hwMap[val] = true
+       }
+       // pbflog.WriteString(*highways + "\n");
+    }
+    return settings{args[0], *leveldbPath, groups, *batchSize, nameMap, hwMap}
 }
 
 func createDecoder(file *os.File) *osmpbf.Decoder {
@@ -165,7 +223,7 @@ func (context *context) init() {
     context.validRelations = make(map[int64]bool)
 
     context.relations = make(map[int64]*osmpbf.Relation)
-    context.formattedRelations = make(map[int64]*jsonRelation)
+    context.formattedRelations = make(map[int64]*jsonWayRel)
     context.pendingRelations = make(map[int64]bool) // resolve state map to stop infinite recursion
 
     context.dictionaryWays = make(map[int64]bool) // these ids may be needed for translation purposes
@@ -173,6 +231,10 @@ func (context *context) init() {
 
     context.translations = make(map[string][]cacheId) // collected translation link map as name -> [cache references]
     context.transcount = 0
+
+    context.streets = make(map[string][]cacheId) // all streets collected here for merge process
+    context.mergedStreets = make(map[int64]*jsonWayRel)
+    context.entrances = make(map[int64]*jsonNode)
 }
 
 
@@ -186,7 +248,7 @@ func (context *context) close() {
     if context.file != nil {
        context.file.Close()
     }
-
+    // pbflog.Close()
     os.RemoveAll(context.config.LevedbPath)
 }
 
@@ -213,10 +275,13 @@ func main() {
     decoder = createDecoder(context.file)
     createCache(decoder, &context)
 
+    // merge street segments
+    mergeStreets(&context)
+
     // output items that match tag selection
     outputValidEntries(&context)
 
-    // fmt.Printf("Translated address point count: %d\n", context.transcount)
+    // fmt.Fprintf(pbflog, "Translated address point count: %d\n", context.transcount)
 
     context.close()
 }
@@ -234,7 +299,7 @@ func collectRelationRefs(d *osmpbf.Decoder, context *context) {
 
             case *osmpbf.Relation:
                 tags, valid := containsValidTags(v.Tags, context.config.Tags)
-                toStreetDictionary(v.ID, osmpbf.RelationType, tags, context.dictionaryRelations, context.translations)
+                toStreetDictionary(v.ID, osmpbf.RelationType, tags, context.dictionaryRelations, context)
                 context.relations[v.ID] = v
                 if valid {
                     context.validRelations[v.ID] = true
@@ -268,7 +333,7 @@ func collectWayRefs(d *osmpbf.Decoder, context *context) {
 
             case *osmpbf.Way:
                 tags, ok := containsValidTags(v.Tags, context.config.Tags)
-                toDict := toStreetDictionary(v.ID, osmpbf.WayType, tags, context.dictionaryWays, context.translations)
+                toDict := toStreetDictionary(v.ID, osmpbf.WayType, tags, context.dictionaryWays, context)
                 if ok || toDict || context.wayRef[v.ID] == true {
                     for _, each := range v.NodeIDs {
                         context.nodeRef[each] = true
@@ -277,7 +342,7 @@ func collectWayRefs(d *osmpbf.Decoder, context *context) {
             }
         }
     }
-    // fmt.Printf("Dictionary size %d\n", len(context.translations))
+    // fmt.Fprintf(pbflog, "Dictionary size %d\n", len(context.translations))
 }
 
 func createCache(d *osmpbf.Decoder, context *context) {
@@ -356,7 +421,7 @@ func createCache(d *osmpbf.Decoder, context *context) {
             }
         }
     }
-    if batch.Len() > 1 {
+    if batch.Len() > 0 {
        if prevtype == "node" {
           cacheFlush(context.nodes, batch)
        } else {
@@ -373,14 +438,37 @@ func outputValidEntries(context *context) {
         printJson(node)
     }
     for id, _ := range context.validWays {
-        way := cacheFetch(context.ways, id).(*jsonWay)
+        way := cacheFetch(context.ways, id).(*jsonWayRel)
+        if _, ok := way.Tags["highway"]; ok { // streets are outputted separately
+            if _, s := context.mergedStreets[id]; s {
+               continue
+            }
+            if highwayOnly(way.Tags, context.config.Tags) {
+               continue
+            }
+        }
         translateAddress(way.Tags, &way.Centroid, context)
         printJson(way)
     }
     for id, _ := range context.validRelations {
         relation := context.formattedRelations[id]
+        if _, ok := relation.Tags["highway"]; ok {
+            if _, s := context.mergedStreets[id]; s {
+               continue
+            }
+            if highwayOnly(relation.Tags, context.config.Tags) {
+               continue
+            }
+        }
         translateAddress(relation.Tags, &relation.Centroid, context)
         printJson(relation)
+    }
+    for _, street := range context.mergedStreets {
+        printJson(street)
+    }
+    for _, entrance := range context.entrances {
+        printJson(entrance)
+        // logJson(entrance)
     }
 }
 
@@ -390,6 +478,12 @@ func printJson(v interface{}) {
     fmt.Println(string(json))
 }
 
+/*
+func logJson(v interface{}) {
+    json, _ := json.Marshal(v)
+    pbflog.WriteString(string(json)+"\n")
+}
+*/
 
 // queue a leveldb write in a batch
 func cacheQueue(batch *leveldb.Batch, id string, val []byte) {
@@ -420,28 +514,59 @@ func collectPoints(db *leveldb.DB, way *osmpbf.Way) ([]Point) {
     return container
 }
 
-func entranceLookup(db *leveldb.DB, way *osmpbf.Way) (location Point, entranceType string) {
+func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber string, context *context) (location Point, entranceType string) {
      var foundLocation Point
      eType := ""
 
      for _, each := range way.NodeIDs {
         node, ok := cacheFetch(db, each).(*jsonNode)
         if !ok {
-           return location, eType // bad reference, skip
+           continue
         }
 
         val, _type := entranceLocation(node)
 
-        if _type == "mainEntrance" {
-            return val, _type // use first detected main entrance
+        if _type == "" {
+           continue
         }
-        if _type == "entrance" {
-           foundLocation = val
-           eType = _type
-           // store found entrance but keep on looking for a main entrance
+        if _type == "mainEntrance" {
+            foundLocation = val
+            eType = _type
+            if street == "" { // no need to parse all entrances
+                return val, _type // use first detected main entrance
+            }
+        } else {
+            if (eType != "mainEntrance") { // don't overrule main entrance by minor entrance
+               // store found entrance but keep on looking for a main entrance
+               foundLocation = val
+               eType = _type
+            }
+        }
+        if street != "" {
+            ref, hasRef := node.Tags["ref"]
+
+            if !hasRef { //  this is suspious. Unit means apartment, not staircase! Anyway, we validate the value below.
+               ref, hasRef = node.Tags["addr:unit"]
+            }
+            _, hasStreet := node.Tags["addr:street"]
+            _, hasNumber := node.Tags["addr:housenumber"]
+            if hasRef && !(hasNumber && hasStreet) { // would not be outputted as an address
+               ref = strings.TrimSpace(ref)
+               if len(ref) > 2 {
+                  if ref[2:3] == " " {
+                     ref = strings.TrimSpace(ref[0:2])
+                  }
+               }
+               if isAddrRef(ref) {
+                  node.Tags["addr:street"] = street // add missing addr info
+                  node.Tags["addr:housenumber"] = housenumber
+                  node.Tags["addr:unit"] = ref // use addr:unit to pass staircase/entrance
+                  context.entrances[node.ID] = node
+               }
+            }
         }
     }
-    return foundLocation, eType;
+    return foundLocation, eType
 }
 
 func cacheFetch(db *leveldb.DB, ID int64) interface{} {
@@ -466,7 +591,7 @@ func cacheFetch(db *leveldb.DB, ID int64) interface{} {
        return &jNode
     }
     if nodetype == "way" {
-       jWay := jsonWay{}
+       jWay := jsonWayRel{}
        json.Unmarshal(data, &jWay)
        return &jWay
     }
@@ -527,13 +652,30 @@ func insideBBox(p, bboxmin, bboxmax *Point) bool {
             p.Lon <= bboxmax.Lon + streetHitDistance
 }
 
-func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *jsonWay) {
+// test
+func BBoxIntersects(bboxmin1, bboxmax1, bboxmin2, bboxmax2 *Point) bool {
+     if bboxmin1.Lat > bboxmax2.Lat + streetHitDistance ||
+        bboxmax1.Lat < bboxmin2.Lat - streetHitDistance ||
+        bboxmin1.Lon > bboxmax2.Lon + streetHitDistance ||
+        bboxmax1.Lon < bboxmin2.Lon - streetHitDistance {
+        return false
+     }
+     return true
+}
+
+func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *jsonWayRel) {
 
     stringid := strconv.FormatInt(way.ID, 10)
     var bufval bytes.Buffer
 
     // special treatment for buildings
     _, isBuilding := way.Tags["building"]
+    street, hasStreet := way.Tags["addr:street"]
+    houseNumber, hasHouseNumber := way.Tags["addr:housenumber"]
+    hasAddress := hasStreet && hasHouseNumber
+    if !hasAddress {
+       street = ""
+    }
 
     // lookup from leveldb
     points := collectPoints(context.nodes, way)
@@ -552,16 +694,16 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
 
     var centroid Point
     var centroidType string
-    if isBuilding {
-        centroid, centroidType = entranceLookup(context.nodes, way)
+    if isBuilding || hasAddress {
+        centroid, centroidType = entranceLookup(context.nodes, way, street, houseNumber, context)
     }
 
     if centroidType == "" {
         centroid = computeCentroid(points)
         centroidType = "average"
     }
-    way.Tags["_centroidType"] = centroidType;
-    jWay := jsonWay{way.ID, "way", way.Tags, centroid, bboxmin, bboxmax}
+    way.Tags["_centroidType"] = centroidType
+    jWay := jsonWayRel{way.ID, "way", way.Tags, centroid, bboxmin, bboxmax}
     json, _ := json.Marshal(jWay)
 
     bufval.WriteString(string(json))
@@ -570,8 +712,11 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
     return stringid, byteval, &jWay
 }
 
-func formatRelation(relation *osmpbf.Relation, context *context) *jsonRelation {
+func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
 
+    if relation == nil {
+       return nil;
+    }
     if _rel, ok := context.formattedRelations[relation.ID]; ok {
         return _rel // already done
     }
@@ -615,7 +760,7 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonRelation {
             }
 
         case osmpbf.WayType:
-            if way, ok := cacheFetch(context.ways, each.ID).(*jsonWay); ok {
+            if way, ok := cacheFetch(context.ways, each.ID).(*jsonWayRel); ok {
                 if cType, ok := way.Tags["_centroidType"]; ok && cType != "average" {
                     if centroidType == "" || cType == "mainEntrance" {
                         centroid = way.Centroid
@@ -636,10 +781,10 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonRelation {
             }
 
         case osmpbf.RelationType:
-            var relation *jsonRelation
+            var relation *jsonWayRel
             relation = formatRelation(context.relations[each.ID], context) // recurse
             if relation == nil {
-                return nil
+                continue
             }
 
             if cType, ok := relation.Tags["_centroidType"]; ok && cType != "average" {
@@ -669,9 +814,9 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonRelation {
         centroidType = "average"
     }
 
-    relation.Tags["_centroidType"] = centroidType;
+    relation.Tags["_centroidType"] = centroidType
 
-    jRelation := jsonRelation{relation.ID, "relation", relation.Tags, centroid, bboxmin, bboxmax}
+    jRelation := jsonWayRel{relation.ID, "relation", relation.Tags, centroid, bboxmin, bboxmax}
     context.formattedRelations[relation.ID] = &jRelation
 
     return &jRelation
@@ -699,36 +844,52 @@ func openLevelDB(path string) *leveldb.DB {
     return db
 }
 
-// extract all keys to array
-// keys := []string{}
-// for k := range v.Tags {
-//     keys = append(keys, k)
-// }
+
+func testTagVal(val string, tv *TagValue) bool {
+     if tv.any == true {
+           return true
+     }
+     if _, ok :=  tv.values[val]; ok {
+           return true
+     }
+     if tv.regex != nil {
+           return tv.regex.MatchString(val)
+     }
+     return false
+}
+
 
 // check tags contain features from a whitelist
-func matchTagsAgainstCompulsoryTagList(tags map[string]string, tagList [][]string) bool {
-    for _, feature := range tagList {
+func matchTagsAgainstCompulsoryTagList(tags map[string]string, compulsory []*TagSelector) bool {
 
-        foundVal, foundKey := tags[feature[0]]
-
-        // key check
-        if !foundKey {
-            return false
-        }
-
-        // value check
-        if len(feature) > 1 {
-            if foundVal != feature[1] {
-                return false
-            }
-        }
+     // must satisfy - all - conditions of compulsory
+     for _, cond := range compulsory {
+           found := false
+           for tag, val := range tags {
+               if tv, ok := cond.tags[tag]; ok {
+                  if testTagVal(val, tv) {
+                     found = true
+                     break
+                  }
+               }
+               for _, tagex := range cond.tagex {
+                   if tagex.regex.MatchString(tag) {
+                       if testTagVal(val, tagex.value) {
+                         found = true
+                         break
+                       }
+                   }
+               }
+           }
+           if found == false {
+              return false
+           }
     }
-
     return true
 }
 
 // check tags contain features from a groups of whitelists
-func containsValidTags(tags map[string]string, groups map[int][][]string) (map[string]string,  bool) {
+func containsValidTags(tags map[string]string, groups map[int][]*TagSelector) (map[string]string,  bool) {
     if hasTags(tags) {
         tags = trimTags(tags)
         for _, list := range groups {
@@ -740,19 +901,41 @@ func containsValidTags(tags map[string]string, groups map[int][][]string) (map[s
     return tags, false
 }
 
-// check if tags contain features which are useful for address translations
-func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]string, dictionaryIds map[int64]bool, dictionary map[string][]cacheId) bool {
 
-    if translateAddresses && hasTags(tags) {
-        if _, ok := tags["highway"]; ok {
+func highwayOnly(tags map[string]string, groups map[int][]*TagSelector) bool {
+    delete(tags, "highway") // remove examined property
+    // check if target is interesting because of other tags
+    for _, list := range groups {
+        if matchTagsAgainstCompulsoryTagList(tags, list) {
+            return false
+        }
+    }
+    return true
+}
+
+// check if tags contain features which are useful for address translations
+// also, group identially named streets
+func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]string, dictionaryIds map[int64]bool,  context *context) bool {
+
+    if hasTags(tags) {
+        if htype, ok := tags["highway"]; ok {
+            if (context.config.highways != nil) {
+               // highway type filter given, validate against allowed values
+               if _, validHWtype := context.config.highways[htype]; !validHWtype {
+                  return false
+               }
+            }
             if name, ok2 := tags["name"]; ok2 {
+                cid := cacheId{ID, mtype}
+                context.streets[name] = append(context.streets[name], cid)
                 for k, v := range tags {
-                    if strings.Contains(k, "name:") && v != name {
-                        cid := cacheId{ID, mtype}
+                  for namekey, _ := range context.config.names {
+                    if strings.HasPrefix(k, namekey) && v != name {
                         dictionaryIds[ID] = true
-                        dictionary[name] = append(dictionary[name], cid)
+                        context.translations[name] = append(context.translations[name], cid)
                         return true
                     }
+                  }
                 }
             }
         }
@@ -761,10 +944,6 @@ func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]strin
 }
 
 func translateAddress(tags map[string]string, location *Point, context *context) {
-
-    if !translateAddresses {
-        return
-    }
     var streetname, housenumber string
     var ok bool
     if streetname, ok = tags["addr:street"]; !ok {
@@ -778,42 +957,113 @@ func translateAddress(tags map[string]string, location *Point, context *context)
 
     if translations, ok2 := context.translations[streetname]; ok2 {
         for _, cid := range translations {
+            var wr *jsonWayRel
+            var ok bool
+
             switch cid.Type {
+              case osmpbf.WayType:
+                wr, ok = cacheFetch(context.ways, cid.ID).(*jsonWayRel)
 
-            case osmpbf.WayType:
-                if way, ok := cacheFetch(context.ways, cid.ID).(*jsonWay); ok {
-                    if !insideBBox(location, &way.BBoxMin, &way.BBoxMax) {
-                        continue;
-                    }
-                    tags2 = way.Tags
-                }
-
-            case osmpbf.RelationType:
-                if rel, ok := context.formattedRelations[cid.ID]; ok {
-                    if !insideBBox(location, &rel.BBoxMin, &rel.BBoxMax) {
-                        continue;
-                    }
-                    tags2 = rel.Tags
-                }
+              case osmpbf.RelationType:
+                wr, ok = context.formattedRelations[cid.ID]
             }
 
+            if !ok {
+               continue
+            }
+            if !insideBBox(location, &wr.BBoxMin, &wr.BBoxMax) {
+               continue
+            }
+            tags2 = wr.Tags
+
             for k, v := range tags2 {
-                if strings.HasPrefix(k, "name:") && streetname != v  {
-                    if _, ok = tags[k]; false && !ok { // name:lang entry not yet in use
-                       tags[k] = housenumber + " " + v // Hooray! Translated!
-                    } else {
-                        postfix := strings.TrimPrefix(k, "name:")
-                        k2 := "addr:street:" + postfix // eg addr:street:sv
-                        if _, ok = tags[k2]; !ok { // not yet used
-                            tags[k2] = v
-                            context.transcount += 1
-                        }
+              if streetname != v  { // new kind of name
+                if strings.HasPrefix(k, "name:") { // language version
+                    postfix := strings.TrimPrefix(k, "name:")
+                    k2 := "addr:street:" + postfix // eg addr:street:sv
+                    if _, ok = tags[k2]; !ok { // not yet used
+                        tags[k2] = v // new translation
+                        context.transcount += 1
                     }
+                } else { // check for alt names, including xxx_name:lang
+                  for namekey, _ := range context.config.names {
+                    if strings.HasPrefix(k, namekey) && !strings.Contains(v, housenumber)  {
+                       // this is a trick to pass unsupported streetname versions to pelias model
+                       // we mark alternative names as addr:street:<alt_name>, eg.addr:street:short_name
+                       // osm importer tracks such names and indexes them properly
+                       k2 := "addr:street:" + namekey
+                       if _, ok = tags[k2]; !ok {
+                          tags[k2] = v
+                          context.transcount += 1
+                       }
+                    }
+                  }
                 }
+              }
             }
         }
     }
 }
+
+
+// merge street segments into one
+func mergeStreets(context *context) {
+
+    for _, cids := range context.streets {
+       var current *jsonWayRel = nil
+       i1 := 0
+       i2 := len(cids) - 1
+       // iterate cids array until all connected sections are processed
+       // collect processed entries to the start of array. i1 points to first unfinished item
+       for ; i1 <= i2; {
+           var wr *jsonWayRel
+           var ok bool
+           added := false
+           for i := i1; i <= i2; i++ {
+             cid := cids[i]
+             switch cid.Type {
+                case osmpbf.WayType:
+                    wr, ok = cacheFetch(context.ways, cid.ID).(*jsonWayRel)
+                case osmpbf.RelationType:
+                    wr, ok = context.formattedRelations[cid.ID]
+                default:
+                   ok = false
+             }
+             if ok {
+                if current == nil {
+                   current = wr
+                   context.mergedStreets[cid.ID]=wr
+                   i1++
+                } else {
+                   if BBoxIntersects(&wr.BBoxMin, &wr.BBoxMax, &current.BBoxMin, &current.BBoxMax) {
+                      added = true
+                      sumBBox(&wr.BBoxMin, &wr.BBoxMax, &current.BBoxMin, &current.BBoxMax)
+                      // assign additional name tags
+                      for k, v := range wr.Tags {
+                          if strings.HasPrefix(k, "name:") {
+                             current.Tags[k] = v
+                          }
+                      }
+                      if i > i1 {
+                         // move unfinished item from start to current array index
+                         cids[i] = cids[i1]
+                      }
+                      i1++
+                   }
+                }
+             }
+           }
+           if !added {
+             if current != nil {
+                current = nil
+             } else {
+               break // nothing to add any more
+             }
+           }
+       }
+    }
+}
+
 
 // trim leading/trailing spaces from keys and values
 func trimTags(tags map[string]string) map[string]string {
@@ -866,7 +1116,7 @@ func entranceLocation(node *jsonNode) (location Point, entranceType string) {
         if val == "main" {
             return Point{Lat: node.Lat, Lon: node.Lon}, "mainEntrance"
         }
-        if val == "yes" {
+        if val == "yes" || val == "staircase" || val == "home" {
            return Point{Lat: node.Lat, Lon: node.Lon}, "entrance"
         }
     }

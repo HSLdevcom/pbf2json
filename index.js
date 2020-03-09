@@ -19,6 +19,8 @@ function createReadStream( config ){
 
   var flags = [];
   flags.push( util.format( '-tags=%s', config.tags ) );
+  flags.push( util.format( '-names=%s', config.names ) );
+  flags.push( util.format( '-highways=%s', config.highways ) );
   if( config.hasOwnProperty( 'leveldb' ) ){
     flags.push( util.format( '-leveldb=%s', config.leveldb ) );
   }
