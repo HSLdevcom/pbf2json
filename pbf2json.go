@@ -514,6 +514,27 @@ func collectPoints(db *leveldb.DB, way *osmpbf.Way) ([]Point) {
     return container
 }
 
+func validateUnit(tags map[string]string, key string)(result string, isvalid bool) {
+    s, hasTag := tags[key]
+    if !hasTag {
+       return "", false
+    }
+    s = strings.TrimSpace(s)
+    if !isAddrRef(s) {
+        return s, false
+    }
+    if len(s) > 2 { // cut additional flat number part away
+        if s[2:3] == " " {
+           s = strings.TrimSpace(s[0:2])
+        } else if s[1:2] == " " {
+           s = strings.TrimSpace(s[0:1])
+        } else {
+          return s, false
+        }
+    }
+    return s, true
+}
+
 func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber string, context *context) (location Point, entranceType string) {
      var foundLocation Point
      eType := ""
@@ -542,27 +563,21 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber 
                eType = _type
             }
         }
-        if street != "" {
-            ref, hasRef := node.Tags["ref"]
-
-            if !hasRef { //  this is suspious. Unit means apartment, not staircase! Anyway, we validate the value below.
-               ref, hasRef = node.Tags["addr:unit"]
-            }
+        if street != "" { // parent entity has valid street address
             _, hasStreet := node.Tags["addr:street"]
             _, hasNumber := node.Tags["addr:housenumber"]
-            if hasRef && !(hasNumber && hasStreet) { // would not be outputted as an address
-               ref = strings.TrimSpace(ref)
-               if len(ref) > 2 {
-                  if ref[2:3] == " " {
-                     ref = strings.TrimSpace(ref[0:2])
-                  }
-               }
-               if isAddrRef(ref) {
-                  node.Tags["addr:street"] = street // add missing addr info
-                  node.Tags["addr:housenumber"] = housenumber
-                  node.Tags["addr:unit"] = ref // use addr:unit to pass staircase/entrance
-                  context.entrances[node.ID] = node
-               }
+            if hasStreet && hasNumber {
+               continue // already valid address entity, do nothing
+            }
+            ref, hasRef := validateUnit(node.Tags, "ref")
+            if !hasRef {
+               ref, hasRef = validateUnit(node.Tags, "addr:unit")
+            }
+            if hasRef {
+              node.Tags["addr:street"] = street // add missing addr info
+              node.Tags["addr:housenumber"] = housenumber
+              node.Tags["addr:unit"] = ref // use addr:unit to pass staircase/entrance
+              context.entrances[node.ID] = node
             }
         }
     }
