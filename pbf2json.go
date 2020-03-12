@@ -72,7 +72,21 @@ type cacheId struct {
     Type osmpbf.MemberType
 }
 
-// var pbflog, _  = os.Create("/tmp/pbflog")
+type amenityName map[string]string
+
+// dictionary for assigning standard names and translations to a set of entities
+var amenityNames = map[string]amenityName {
+    "library": { "fi": "Kirjasto", "en":"Library", "sv":"Bibliotek" },
+    "fire_station": { "fi":"Paloasema", "en":"Fire station", "sv":"Brandstation" },
+    "university": { "fi":"Yliopisto", "en":"University", "sv":"Universitet" },
+    "bus_station": { "fi":"Linja-autoasema", "en":"Bus station", "sv":"Busstationen" },
+    "hospital": { "fi":"Sairaala", "en":"Hospital", "sv":"Sjukhus" },
+    "police": { "fi":"Poliisiasema", "en":"Police station", "sv":"Polisstation" },
+    "townhall": { "fi":"Kaupungintalo", "en":"Town hall", "sv":"Stadshus" },
+}
+
+//var pbflog, _  = os.Create("/tmp/pbflog")
+
 
 type context struct {
     file *os.File
@@ -106,6 +120,7 @@ type context struct {
 
     config *settings
     transcount int64
+    amenitycount int64
 }
 
 func getSettings() settings {
@@ -231,6 +246,7 @@ func (context *context) init() {
 
     context.translations = make(map[string][]cacheId) // collected translation link map as name -> [cache references]
     context.transcount = 0
+    context.amenitycount = 0
 
     context.streets = make(map[string][]cacheId) // all streets collected here for merge process
     context.mergedStreets = make(map[int64]*jsonWayRel)
@@ -282,6 +298,7 @@ func main() {
     outputValidEntries(&context)
 
     // fmt.Fprintf(pbflog, "Translated address point count: %d\n", context.transcount)
+    // fmt.Fprintf(pbflog, "Translated amenities: %d\n", context.amenitycount)
 
     context.close()
 }
@@ -960,11 +977,26 @@ func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]strin
 
 func translateAddress(tags map[string]string, location *Point, context *context) {
     var streetname, housenumber string
-    var ok bool
-    if streetname, ok = tags["addr:street"]; !ok {
-       return
+    var ok, address bool
+
+    if streetname, ok = tags["addr:street"]; ok {
+        if housenumber, ok = tags["addr:housenumber"]; ok {
+           address = true
+        }
     }
-    if housenumber, ok = tags["addr:housenumber"]; !ok {
+    if amenity, hasAmenity := tags["amenity"]; hasAmenity {
+        if names, hasNames := amenityNames[amenity]; hasNames {
+             for lang, name := range names {
+                 key := "name:" + lang
+                 if _, hasLang := tags[key]; !hasLang {
+                    // use unused name slot
+                    tags[key] = name
+                    context.amenitycount++
+                 }
+             }
+        }
+    }
+    if !address {
        return
     }
 
