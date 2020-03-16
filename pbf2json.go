@@ -988,7 +988,12 @@ func translateAddress(tags map[string]string, location *Point, context *context)
     if amenity, hasAmenity := tags["amenity"]; hasAmenity {
         if names, hasNames := amenityNames[amenity]; hasNames {
              for lang, name := range names {
-                 key := "name:" + lang
+                 var key string
+                 if lang == "fi" {
+                    key = "alt_name" // don't overrule potential "name" property
+                 } else {
+                    key = "name:" + lang
+                 }
                  if _, hasLang := tags[key]; !hasLang {
                     // use unused name slot
                     tags[key] = name
