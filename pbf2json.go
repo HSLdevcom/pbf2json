@@ -81,6 +81,7 @@ var amenityNames = map[string]amenityName {
     "university": { "fi":"Yliopisto", "en":"University", "sv":"Universitet" },
     "bus_station": { "fi":"Linja-autoasema", "en":"Bus station", "sv":"Busstationen" },
     "hospital": { "fi":"Sairaala", "en":"Hospital", "sv":"Sjukhus" },
+    "clinic": { "fi":"Terveyskeskus", "en":"Medical center", "sv":"Hälsocentral" },
     "police": { "fi":"Poliisiasema", "en":"Police station", "sv":"Polisstation" },
     "townhall": { "fi":"Kaupungintalo", "en":"Town hall", "sv":"Stadshus" },
 }
