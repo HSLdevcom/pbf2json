@@ -609,9 +609,6 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber 
         if street != "" { // parent entity has valid street address
             _, hasStreet := node.Tags["addr:street"]
             _, hasNumber := node.Tags["addr:housenumber"]
-            if hasStreet && hasNumber {
-               continue // already valid address entity, do nothing
-            }
             ref, hasRef := validateUnit(node.Tags, "ref")
             if !hasRef {
                ref, hasRef = validateUnit(node.Tags, "addr:unit")
