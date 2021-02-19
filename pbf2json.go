@@ -509,7 +509,8 @@ func outputValidEntries(context *context) {
         printJson(water)
     }
     for _, entrance := range context.entrances {
-        printJson(entrance)
+        translateAddress(entrance.Tags, &Point{entrance.Lat, entrance.Lon}, context)
+	printJson(entrance)
         // logJson(entrance)
     }
 }
