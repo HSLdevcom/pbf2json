@@ -17,7 +17,7 @@ import "github.com/syndtr/goleveldb/leveldb"
 import "github.com/paulmach/go.geo"
 //import "github.com/davecgh/go-spew/spew"
 
-const streetHitDistance = 0.005 // in wgs coords, some hundreds of meters
+const streetHitDistance = 0.01 // in wgs coords, about a kilometer
 var isAddrRef = regexp.MustCompile(`^[a-zA-Z]{1}([1-9])?$`).MatchString
 
 type Point struct {
@@ -87,7 +87,6 @@ var amenityNames = map[string]amenityName {
 }
 
 //var pbflog, _  = os.Create("/tmp/pbflog")
-
 
 type context struct {
     file *os.File
@@ -664,6 +663,18 @@ func formatNode(node *osmpbf.Node) (id string, val []byte, jnode *jsonNode) {
     stringid := strconv.FormatInt(node.ID, 10)
     var bufval bytes.Buffer
 
+    _, hasStreet := node.Tags["addr:street"]
+    _, hasHouseNumber := node.Tags["addr:housenumber"]
+    hasAddress := hasStreet && hasHouseNumber
+    if hasAddress {
+      _, hasUnit := validateUnit(node.Tags, "addr:unit")
+      if !hasUnit {
+        ref, hasRef := validateUnit(node.Tags, "ref")
+	if hasRef {
+          node.Tags["addr:unit"] = ref // use addr:unit to pass staircase/entrance
+	}
+      }
+    }
     jNode := jsonNode{node.ID, "node", node.Lat, node.Lon, node.Tags}
     json, _ := json.Marshal(jNode)
 
@@ -734,6 +745,14 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
     hasAddress := hasStreet && hasHouseNumber
     if !hasAddress {
        street = ""
+    } else {
+      _, hasUnit := validateUnit(way.Tags, "addr:unit")
+      if !hasUnit {
+        ref, hasRef := validateUnit(way.Tags, "ref")
+	if hasRef {
+          way.Tags["addr:unit"] = ref // use addr:unit to pass staircase/entrance
+	}
+      }
     }
 
     // lookup from leveldb
