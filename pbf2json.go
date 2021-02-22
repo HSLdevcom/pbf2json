@@ -17,7 +17,7 @@ import "github.com/syndtr/goleveldb/leveldb"
 import "github.com/paulmach/go.geo"
 //import "github.com/davecgh/go-spew/spew"
 
-const streetHitDistance = 0.005 // in wgs coords, some hundreds of meters
+const streetHitDistance = 0.01 // in wgs coords, about a kilometer
 var isAddrRef = regexp.MustCompile(`^[a-zA-Z]{1}([1-9])?$`).MatchString
 
 type Point struct {
@@ -88,7 +88,6 @@ var amenityNames = map[string]amenityName {
 
 //var pbflog, _  = os.Create("/tmp/pbflog")
 
-
 type context struct {
     file *os.File
 
@@ -116,6 +115,8 @@ type context struct {
     translations map[string][]cacheId
     streets map[string][]cacheId
     mergedStreets map[int64]*jsonWayRel
+    waterways map[string][]cacheId
+    mergedWater map[int64]*jsonWayRel
 
     entrances map[int64]*jsonNode // accurate address points generated runtime
 
@@ -252,6 +253,9 @@ func (context *context) init() {
     context.streets = make(map[string][]cacheId) // all streets collected here for merge process
     context.mergedStreets = make(map[int64]*jsonWayRel)
     context.entrances = make(map[int64]*jsonNode)
+
+    context.waterways = make(map[string][]cacheId) // for waterway merging
+    context.mergedWater = make(map[int64]*jsonWayRel)
 }
 
 
@@ -292,8 +296,9 @@ func main() {
     decoder = createDecoder(context.file)
     createCache(decoder, &context)
 
-    // merge street segments
-    mergeStreets(&context)
+    // merge segmented data
+    mergeSegments(&context, context.streets, context.mergedStreets)
+    mergeSegments(&context, context.waterways, context.mergedWater)
 
     // output items that match tag selection
     outputValidEntries(&context)
@@ -317,7 +322,7 @@ func collectRelationRefs(d *osmpbf.Decoder, context *context) {
 
             case *osmpbf.Relation:
                 tags, valid := containsValidTags(v.Tags, context.config.Tags)
-                toStreetDictionary(v.ID, osmpbf.RelationType, tags, context.dictionaryRelations, context)
+                toDictionary(v.ID, osmpbf.RelationType, tags, context.dictionaryRelations, context)
                 context.relations[v.ID] = v
                 if valid {
                     context.validRelations[v.ID] = true
@@ -351,7 +356,7 @@ func collectWayRefs(d *osmpbf.Decoder, context *context) {
 
             case *osmpbf.Way:
                 tags, ok := containsValidTags(v.Tags, context.config.Tags)
-                toDict := toStreetDictionary(v.ID, osmpbf.WayType, tags, context.dictionaryWays, context)
+                toDict := toDictionary(v.ID, osmpbf.WayType, tags, context.dictionaryWays, context)
                 if ok || toDict || context.wayRef[v.ID] == true {
                     for _, each := range v.NodeIDs {
                         context.nodeRef[each] = true
@@ -461,7 +466,15 @@ func outputValidEntries(context *context) {
             if _, s := context.mergedStreets[id]; s {
                continue
             }
-            if highwayOnly(way.Tags, context.config.Tags) {
+            if xwayOnly(way.Tags, "highway", context.config.Tags) {
+               continue
+            }
+        }
+        if _, ok := way.Tags["waterway"]; ok { // waterways are outputted separately
+            if _, s := context.mergedWater[id]; s {
+               continue
+            }
+            if xwayOnly(way.Tags, "waterway", context.config.Tags) {
                continue
             }
         }
@@ -474,7 +487,15 @@ func outputValidEntries(context *context) {
             if _, s := context.mergedStreets[id]; s {
                continue
             }
-            if highwayOnly(relation.Tags, context.config.Tags) {
+            if xwayOnly(relation.Tags, "highway", context.config.Tags) {
+               continue
+            }
+        }
+        if _, ok := relation.Tags["waterway"]; ok {
+            if _, s := context.mergedWater[id]; s {
+               continue
+            }
+            if xwayOnly(relation.Tags, "waterway", context.config.Tags) {
                continue
             }
         }
@@ -484,8 +505,12 @@ func outputValidEntries(context *context) {
     for _, street := range context.mergedStreets {
         printJson(street)
     }
+    for _, water := range context.mergedWater {
+        printJson(water)
+    }
     for _, entrance := range context.entrances {
-        printJson(entrance)
+        translateAddress(entrance.Tags, &Point{entrance.Lat, entrance.Lon}, context)
+	printJson(entrance)
         // logJson(entrance)
     }
 }
@@ -584,16 +609,17 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber 
         if street != "" { // parent entity has valid street address
             _, hasStreet := node.Tags["addr:street"]
             _, hasNumber := node.Tags["addr:housenumber"]
-            if hasStreet && hasNumber {
-               continue // already valid address entity, do nothing
-            }
             ref, hasRef := validateUnit(node.Tags, "ref")
             if !hasRef {
                ref, hasRef = validateUnit(node.Tags, "addr:unit")
             }
             if hasRef {
-              node.Tags["addr:street"] = street // add missing addr info
-              node.Tags["addr:housenumber"] = housenumber
+	      if !hasStreet {
+	          node.Tags["addr:street"] = street // add missing addr info
+              }
+	      if !hasNumber {
+	          node.Tags["addr:housenumber"] = housenumber
+              }
               node.Tags["addr:unit"] = ref // use addr:unit to pass staircase/entrance
               context.entrances[node.ID] = node
             }
@@ -638,6 +664,18 @@ func formatNode(node *osmpbf.Node) (id string, val []byte, jnode *jsonNode) {
     stringid := strconv.FormatInt(node.ID, 10)
     var bufval bytes.Buffer
 
+    _, hasStreet := node.Tags["addr:street"]
+    _, hasHouseNumber := node.Tags["addr:housenumber"]
+    hasAddress := hasStreet && hasHouseNumber
+    if hasAddress {
+      _, hasUnit := validateUnit(node.Tags, "addr:unit")
+      if !hasUnit {
+        ref, hasRef := validateUnit(node.Tags, "ref")
+	if hasRef {
+          node.Tags["addr:unit"] = ref // use addr:unit to pass staircase/entrance
+	}
+      }
+    }
     jNode := jsonNode{node.ID, "node", node.Lat, node.Lon, node.Tags}
     json, _ := json.Marshal(jNode)
 
@@ -708,6 +746,14 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
     hasAddress := hasStreet && hasHouseNumber
     if !hasAddress {
        street = ""
+    } else {
+      _, hasUnit := validateUnit(way.Tags, "addr:unit")
+      if !hasUnit {
+        ref, hasRef := validateUnit(way.Tags, "ref")
+	if hasRef {
+          way.Tags["addr:unit"] = ref // use addr:unit to pass staircase/entrance
+	}
+      }
     }
 
     // lookup from leveldb
@@ -935,8 +981,8 @@ func containsValidTags(tags map[string]string, groups map[int][]*TagSelector) (m
 }
 
 
-func highwayOnly(tags map[string]string, groups map[int][]*TagSelector) bool {
-    delete(tags, "highway") // remove examined property
+func xwayOnly(tags map[string]string, tag string, groups map[int][]*TagSelector) bool {
+    delete(tags, tag) // remove examined property
     // check if target is interesting because of other tags
     for _, list := range groups {
         if matchTagsAgainstCompulsoryTagList(tags, list) {
@@ -947,8 +993,8 @@ func highwayOnly(tags map[string]string, groups map[int][]*TagSelector) bool {
 }
 
 // check if tags contain features which are useful for address translations
-// also, group identially named streets
-func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]string, dictionaryIds map[int64]bool,  context *context) bool {
+// also, group identially named segmented ways (highways, waterways)
+func toDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]string, dictionaryIds map[int64]bool,  context *context) bool {
 
     if hasTags(tags) {
         if htype, ok := tags["highway"]; ok {
@@ -970,6 +1016,12 @@ func toStreetDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]strin
                     }
                   }
                 }
+            }
+        }
+	if _, ok := tags["waterway"]; ok {
+            if name, ok2 := tags["name"]; ok2 {
+                cid := cacheId{ID, mtype}
+                context.waterways[name] = append(context.waterways[name], cid)
             }
         }
     }
@@ -1058,11 +1110,10 @@ func translateAddress(tags map[string]string, location *Point, context *context)
     }
 }
 
+// merge way segments into one
+func mergeSegments(context *context, src map[string][]cacheId, dst map[int64]*jsonWayRel) {
 
-// merge street segments into one
-func mergeStreets(context *context) {
-
-    for _, cids := range context.streets {
+    for _, cids := range src {
        var current *jsonWayRel = nil
        i1 := 0
        i2 := len(cids) - 1
@@ -1085,7 +1136,7 @@ func mergeStreets(context *context) {
              if ok {
                 if current == nil {
                    current = wr
-                   context.mergedStreets[cid.ID]=wr
+                   dst[cid.ID]=wr
                    i1++
                 } else {
                    if BBoxIntersects(&wr.BBoxMin, &wr.BBoxMax, &current.BBoxMin, &current.BBoxMax) {
