@@ -1106,7 +1106,6 @@ func translateAddress(tags map[string]string, location *Point, context *context)
             tags2 = wr.Tags
 
             for k, v := range tags2 {
-              if streetname != v  { // new kind of name
                 if strings.HasPrefix(k, "name:") { // language version
                     postfix := strings.TrimPrefix(k, "name:")
                     k2 := "addr:street:" + postfix // eg addr:street:sv
@@ -1117,7 +1116,7 @@ func translateAddress(tags map[string]string, location *Point, context *context)
 			  context.fitranscount++
 			}
                     }
-                } else { // check for alt names, including xxx_name:lang
+                } else if streetname != v  { // check for alt names, including xxx_name:lang
                   for namekey, _ := range context.config.names {
                     if strings.HasPrefix(k, namekey) && !strings.Contains(v, housenumber)  {
                        // this is a trick to pass unsupported streetname versions to pelias model
@@ -1131,7 +1130,6 @@ func translateAddress(tags map[string]string, location *Point, context *context)
                     }
                   }
                 }
-              }
             }
         }
     }
