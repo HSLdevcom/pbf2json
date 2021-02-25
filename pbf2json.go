@@ -86,8 +86,6 @@ var amenityNames = map[string]amenityName {
     "townhall": { "fi":"Kaupungintalo", "en":"Town hall", "sv":"Stadshus" },
 }
 
-//var pbflog, _  = os.Create("/tmp/pbflog")
-
 type context struct {
     file *os.File
 
@@ -122,6 +120,7 @@ type context struct {
 
     config *settings
     transcount int64
+    fitranscount int64
     amenitycount int64
 }
 
@@ -146,8 +145,6 @@ func getSettings() settings {
     if len(*tagList) < 1 {
         log.Fatal("Nothing to do, you must specify tags to match against")
     }
-
-    // pbflog.WriteString(*tagList + "\n");
 
     // parse tag conditions
     groups := make(map[int][]*TagSelector)
@@ -188,7 +185,6 @@ func getSettings() settings {
     for _, name := range strings.Split(*names, ",") {
         nameMap[name] = true
     }
-    // pbflog.WriteString(*names+ "\n");
 
     var hwMap map[string]bool
     if *highways != "" {
@@ -196,7 +192,6 @@ func getSettings() settings {
        for _, val := range strings.Split(*highways, ",") {
            hwMap[val] = true
        }
-       // pbflog.WriteString(*highways + "\n");
     }
     return settings{args[0], *leveldbPath, groups, *batchSize, nameMap, hwMap}
 }
@@ -248,6 +243,7 @@ func (context *context) init() {
 
     context.translations = make(map[string][]cacheId) // collected translation link map as name -> [cache references]
     context.transcount = 0
+    context.fitranscount = 0
     context.amenitycount = 0
 
     context.streets = make(map[string][]cacheId) // all streets collected here for merge process
@@ -269,7 +265,6 @@ func (context *context) close() {
     if context.file != nil {
        context.file.Close()
     }
-    // pbflog.Close()
     os.RemoveAll(context.config.LevedbPath)
 }
 
@@ -303,8 +298,9 @@ func main() {
     // output items that match tag selection
     outputValidEntries(&context)
 
-    // fmt.Fprintf(pbflog, "Translated address point count: %d\n", context.transcount)
-    // fmt.Fprintf(pbflog, "Translated amenities: %d\n", context.amenitycount)
+    println("Translated address point count", context.transcount)
+    println("Address translations to fi", context.fitranscount)
+    println("Translated amenities", context.amenitycount)
 
     context.close()
 }
@@ -365,7 +361,7 @@ func collectWayRefs(d *osmpbf.Decoder, context *context) {
             }
         }
     }
-    // fmt.Fprintf(pbflog, "Dictionary size %d\n", len(context.translations))
+    println("Street dictionary size", len(context.translations))
 }
 
 func createCache(d *osmpbf.Decoder, context *context) {
@@ -510,7 +506,7 @@ func outputValidEntries(context *context) {
     }
     for _, entrance := range context.entrances {
         translateAddress(entrance.Tags, &Point{entrance.Lat, entrance.Lon}, context)
-	printJson(entrance)
+        printJson(entrance)
         // logJson(entrance)
     }
 }
@@ -524,7 +520,7 @@ func printJson(v interface{}) {
 /*
 func logJson(v interface{}) {
     json, _ := json.Marshal(v)
-    pbflog.WriteString(string(json)+"\n")
+    println(string(json)")
 }
 */
 
@@ -614,11 +610,11 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber 
                ref, hasRef = validateUnit(node.Tags, "addr:unit")
             }
             if hasRef {
-	      if !hasStreet {
-	          node.Tags["addr:street"] = street // add missing addr info
+              if !hasStreet {
+                  node.Tags["addr:street"] = street // add missing addr info
               }
-	      if !hasNumber {
-	          node.Tags["addr:housenumber"] = housenumber
+              if !hasNumber {
+                  node.Tags["addr:housenumber"] = housenumber
               }
               node.Tags["addr:unit"] = ref // use addr:unit to pass staircase/entrance
               context.entrances[node.ID] = node
@@ -671,9 +667,9 @@ func formatNode(node *osmpbf.Node) (id string, val []byte, jnode *jsonNode) {
       _, hasUnit := validateUnit(node.Tags, "addr:unit")
       if !hasUnit {
         ref, hasRef := validateUnit(node.Tags, "ref")
-	if hasRef {
+        if hasRef {
           node.Tags["addr:unit"] = ref // use addr:unit to pass staircase/entrance
-	}
+        }
       }
     }
     jNode := jsonNode{node.ID, "node", node.Lat, node.Lon, node.Tags}
@@ -750,9 +746,9 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
       _, hasUnit := validateUnit(way.Tags, "addr:unit")
       if !hasUnit {
         ref, hasRef := validateUnit(way.Tags, "ref")
-	if hasRef {
+        if hasRef {
           way.Tags["addr:unit"] = ref // use addr:unit to pass staircase/entrance
-	}
+        }
       }
     }
 
@@ -997,28 +993,56 @@ func xwayOnly(tags map[string]string, tag string, groups map[int][]*TagSelector)
 func toDictionary(ID int64, mtype osmpbf.MemberType, tags map[string]string, dictionaryIds map[int64]bool,  context *context) bool {
 
     if hasTags(tags) {
-        if htype, ok := tags["highway"]; ok {
+        if htype, okh := tags["highway"]; okh {
             if (context.config.highways != nil) {
                // highway type filter given, validate against allowed values
                if _, validHWtype := context.config.highways[htype]; !validHWtype {
                   return false
                }
             }
-            if name, ok2 := tags["name"]; ok2 {
+	    var ok bool
+	    var name string
+            namefi, okfi := tags["name:fi"]
+            namesv, oksv := tags["name:sv"];
+            if namedef, ok2 := tags["name"]; ok2 {
+                name = namedef
+                ok = true
+	    } else if okfi {
+                name = namefi
+                ok = true
+            } else if oksv {
+	        name = namesv
+                ok = true
+            }
+            if ok {
+	        hastransl := false
                 cid := cacheId{ID, mtype}
                 context.streets[name] = append(context.streets[name], cid)
                 for k, v := range tags {
                   for namekey, _ := range context.config.names {
-                    if strings.HasPrefix(k, namekey) && v != name {
-                        dictionaryIds[ID] = true
-                        context.translations[name] = append(context.translations[name], cid)
-                        return true
+                    if strings.HasPrefix(k, namekey) {
+		       	if  v != name {
+			     context.translations[name] = append(context.translations[name], cid)
+			     hastransl = true
+			}
+			if okfi && namefi != name && v != namefi {
+			    context.translations[namefi] = append(context.translations[namefi], cid)
+			    hastransl = true
+                        }
+                        if oksv && namesv != name && v != namesv {
+			    context.translations[namesv] = append(context.translations[namesv], cid)
+			    hastransl = true
+                        }
                     }
                   }
                 }
+		if hastransl {
+		    dictionaryIds[ID] = true
+		    return true
+		}
             }
         }
-	if _, ok := tags["waterway"]; ok {
+        if _, ok := tags["waterway"]; ok {
             if name, ok2 := tags["name"]; ok2 {
                 cid := cacheId{ID, mtype}
                 context.waterways[name] = append(context.waterways[name], cid)
@@ -1088,7 +1112,10 @@ func translateAddress(tags map[string]string, location *Point, context *context)
                     k2 := "addr:street:" + postfix // eg addr:street:sv
                     if _, ok = tags[k2]; !ok { // not yet used
                         tags[k2] = v // new translation
-                        context.transcount += 1
+			context.transcount++
+			if postfix == "fi" {
+			  context.fitranscount++
+			}
                     }
                 } else { // check for alt names, including xxx_name:lang
                   for namekey, _ := range context.config.names {
@@ -1099,7 +1126,7 @@ func translateAddress(tags map[string]string, location *Point, context *context)
                        k2 := "addr:street:" + namekey
                        if _, ok = tags[k2]; !ok {
                           tags[k2] = v
-                          context.transcount += 1
+                          context.transcount++
                        }
                     }
                   }
