@@ -574,6 +574,16 @@ func validateUnit(tags map[string]string, key string)(result string, isvalid boo
     return s, true
 }
 
+func addressMatch(street string, housenumber string, tags map[string]string) bool {
+     street2, hasStreet := tags["addr:street"]
+     housenumber2, hasNumber := tags["addr:housenumber"]
+     if (hasStreet && street != "" && street2 != street) || (hasNumber && housenumber != "" && housenumber2 != housenumber) {
+         // println("Skipping mismatching entrance " + street + " " + housenumber + ", " + street2 + " " + housenumber2)
+         return false
+     }
+     return true
+}
+
 func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber string, context *context) (location Point, entranceType string) {
      var foundLocation Point
      eType := ""
@@ -589,6 +599,15 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber 
         if _type == "" {
            continue
         }
+
+        // large buildings may have several entrances. We must be careful not to use
+        //  an entrance point on one street for an address on another street
+	if !addressMatch(street, housenumber, node.Tags) {
+	    continue // do not assign entrances to wrong streets
+        }
+	_, hasStreet := node.Tags["addr:street"]
+        _, hasNumber := node.Tags["addr:housenumber"]
+
         if _type == "mainEntrance" {
             foundLocation = val
             eType = _type
@@ -603,8 +622,6 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber 
             }
         }
         if street != "" { // parent entity has valid street address
-            _, hasStreet := node.Tags["addr:street"]
-            _, hasNumber := node.Tags["addr:housenumber"]
             ref, hasRef := validateUnit(node.Tags, "ref")
             if !hasRef {
                ref, hasRef = validateUnit(node.Tags, "addr:unit")
@@ -742,6 +759,7 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
     hasAddress := hasStreet && hasHouseNumber
     if !hasAddress {
        street = ""
+       houseNumber = ""
     } else {
       _, hasUnit := validateUnit(way.Tags, "addr:unit")
       if !hasUnit {
@@ -808,6 +826,14 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
     var bboxmin, bboxmax Point
     bbox_init := false
 
+    street, hasStreet := relation.Tags["addr:street"]
+    houseNumber, hasHouseNumber := relation.Tags["addr:housenumber"]
+    hasAddress := hasStreet && hasHouseNumber
+    if !hasAddress {
+       street = ""
+       houseNumber = ""
+    }
+
     centroidType := ""
     for _, each := range relation.Members {
         switch each.Type {
@@ -823,9 +849,11 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
                     expandBBox(&p, &bboxmin, &bboxmax)
                 }
                 if val, cType := entranceLocation(node); cType != "" {
-                    if centroidType == "" || cType == "mainEntrance" {
+		    if addressMatch(street, houseNumber, node.Tags) && (centroidType == "" || cType == "mainEntrance") {
                         centroid = val
                         centroidType = cType
+                    } else {
+                      points = append(points, p)
                     }
                 } else {
                     points = append(points, p)
@@ -837,10 +865,12 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
         case osmpbf.WayType:
             if way, ok := cacheFetch(context.ways, each.ID).(*jsonWayRel); ok {
                 if cType, ok := way.Tags["_centroidType"]; ok && cType != "average" {
-                    if centroidType == "" || cType == "mainEntrance" {
+                    if addressMatch(street, houseNumber, way.Tags) && (centroidType == "" || cType == "mainEntrance") {
                         centroid = way.Centroid
                         centroidType = cType
-                    }
+                    } else {
+                        points = append(points, way.Centroid)
+               	    }
                 } else {
                     points = append(points, way.Centroid)
                 }
@@ -863,9 +893,11 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
             }
 
             if cType, ok := relation.Tags["_centroidType"]; ok && cType != "average" {
-                if centroidType == "" || cType == "mainEntrance" {
+                if addressMatch(street, houseNumber, relation.Tags) && (centroidType == "" || cType == "mainEntrance") {
                     centroid = relation.Centroid
                     centroidType = cType
+                } else {
+                    points = append(points, relation.Centroid)
                 }
             } else {
                 points = append(points, relation.Centroid)
