@@ -19,6 +19,9 @@ import "github.com/paulmach/go.geo"
 
 const streetHitDistance = 0.01 // in wgs coords, about a kilometer
 var isAddrRef = regexp.MustCompile(`^[a-zA-Z]{1}([1-9])?$`).MatchString
+var numEx = regexp.MustCompile(`[-]?\d[\d,]*[\.]?[\d{2}]*`)
+var logEntranceMismatch = os.Getenv("DEBUG") == "1"
+var prevEntranceMsg = ""
 
 type Point struct {
     Lat  float64 `json:"lat"`
@@ -574,12 +577,22 @@ func validateUnit(tags map[string]string, key string)(result string, isvalid boo
     return s, true
 }
 
-func addressMatch(street string, housenumber string, tags map[string]string) bool {
+func addressMatch(street string, housenumber string, tags map[string]string, t string, id int64) bool {
      street2, hasStreet := tags["addr:street"]
      housenumber2, hasNumber := tags["addr:housenumber"]
      if (hasStreet && street != "" && street2 != street) || (hasNumber && housenumber != "" && housenumber2 != housenumber) {
-         // println("Skipping mismatching entrance " + street + " " + housenumber + ", " + street2 + " " + housenumber2)
-         return false
+        if logEntranceMismatch {
+	    n1 := numEx.FindString(housenumber)
+	    n2 := numEx.FindString(housenumber2)
+	    if n1 != n2 {
+	       entMsg := "Entrance mismatch " + t + "/"  + strconv.FormatInt(id, 10) + ": " + street + " " + housenumber + ", " + street2 + " " + housenumber2
+	       if entMsg != prevEntranceMsg {
+	           println(entMsg)
+		   prevEntranceMsg = entMsg
+               }
+            }
+	}
+        return false
      }
      return true
 }
@@ -602,7 +615,7 @@ func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber 
 
         // large buildings may have several entrances. We must be careful not to use
         //  an entrance point on one street for an address on another street
-	if !addressMatch(street, housenumber, node.Tags) {
+	if !addressMatch(street, housenumber, node.Tags, "way", way.ID) {
 	    continue // do not assign entrances to wrong streets
         }
 	_, hasStreet := node.Tags["addr:street"]
@@ -849,7 +862,7 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
                     expandBBox(&p, &bboxmin, &bboxmax)
                 }
                 if val, cType := entranceLocation(node); cType != "" {
-		    if addressMatch(street, houseNumber, node.Tags) && (centroidType == "" || cType == "mainEntrance") {
+		    if addressMatch(street, houseNumber, node.Tags, "relation", relation.ID) && (centroidType == "" || cType == "mainEntrance") {
                         centroid = val
                         centroidType = cType
                     } else {
@@ -865,7 +878,7 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
         case osmpbf.WayType:
             if way, ok := cacheFetch(context.ways, each.ID).(*jsonWayRel); ok {
                 if cType, ok := way.Tags["_centroidType"]; ok && cType != "average" {
-                    if addressMatch(street, houseNumber, way.Tags) && (centroidType == "" || cType == "mainEntrance") {
+                    if addressMatch(street, houseNumber, way.Tags, "relation", relation.ID) && (centroidType == "" || cType == "mainEntrance") {
                         centroid = way.Centroid
                         centroidType = cType
                     } else {
@@ -893,7 +906,7 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
             }
 
             if cType, ok := relation.Tags["_centroidType"]; ok && cType != "average" {
-                if addressMatch(street, houseNumber, relation.Tags) && (centroidType == "" || cType == "mainEntrance") {
+                if addressMatch(street, houseNumber, relation.Tags, "relation", relation.ID) && (centroidType == "" || cType == "mainEntrance") {
                     centroid = relation.Centroid
                     centroidType = cType
                 } else {
