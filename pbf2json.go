@@ -127,6 +127,40 @@ type context struct {
     amenitycount int64
 }
 
+
+// GetLineCentroid - compute the centroid of a line string
+func GetLineCentroid(ps *geo.PointSet) *geo.Point {
+
+	path := geo.NewPath()
+	path.PointSet = *ps
+
+	halfDistance := path.Distance() / 2
+	travelled := 0.0
+
+	for i := 0; i < len(path.PointSet)-1; i++ {
+
+		segment := geo.NewLine(&path.PointSet[i], &path.PointSet[i+1])
+		distance := segment.Distance()
+
+		// middle line segment
+		if (travelled + distance) > halfDistance {
+			var remainder = halfDistance - travelled
+			return segment.Interpolate(remainder / distance)
+		}
+
+		travelled += distance
+	}
+
+	return ps.GeoCentroid()
+}
+
+// GetPolygonCentroid - compute the centroid of a polygon set
+// using a spherical co-ordinate system
+func GetPolygonCentroid(ps *geo.PointSet) *geo.Point {
+	// GeoCentroid function added in https://github.com/paulmach/go.geo/pull/24
+	return ps.GeoCentroid()
+}
+
 func getSettings() settings {
 
     // command line flags
