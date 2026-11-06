@@ -99,6 +99,10 @@ type context struct {
     nodeRef map[int64]bool
     wayRef map[int64]bool
 
+    // outer ways of building multipolygons: entrances are searched from their nodes
+    buildingOuterWays map[int64]bool
+    outerWayNodes map[int64][]int64
+
     // store time consuming tag comparison results to these maps
     validNodes map[int64]bool
     validWays map[int64]bool
@@ -266,6 +270,8 @@ func (context *context) init() {
     // set up reference maps
     context.nodeRef = make(map[int64]bool) // these ids are needed by OSM references
     context.wayRef = make(map[int64]bool)
+    context.buildingOuterWays = make(map[int64]bool)
+    context.outerWayNodes = make(map[int64][]int64)
 
     context.validNodes = make(map[int64]bool) // these ids will be outputted as matching items
     context.validWays = make(map[int64]bool)
@@ -362,6 +368,7 @@ func collectRelationRefs(d *osmpbf.Decoder, context *context) {
                 }
 
                 // always cache all relations and items referred by them
+                buildingRelation := isBuildingMultipolygon(v.Tags)
                 for _, each := range v.Members {
                     switch each.Type {
                         case osmpbf.NodeType:
@@ -369,6 +376,9 @@ func collectRelationRefs(d *osmpbf.Decoder, context *context) {
 
                         case osmpbf.WayType:
                             context.wayRef[each.ID] = true
+                            if buildingRelation && isOuterRole(each.Role) {
+                                context.buildingOuterWays[each.ID] = true
+                            }
                     }
                 }
             }
@@ -631,6 +641,21 @@ func addressMatch(street string, housenumber string, tags map[string]string, t s
      return true
 }
 
+func isOuterRole(role string) bool {
+    return role == "outer" || role == ""
+}
+
+// multipolygon relation which describes a building or an address point
+func isBuildingMultipolygon(tags map[string]string) bool {
+    if tags["type"] != "multipolygon" {
+        return false
+    }
+    _, isBuilding := tags["building"]
+    _, hasStreet := tags["addr:street"]
+    _, hasHouseNumber := tags["addr:housenumber"]
+    return isBuilding || (hasStreet && hasHouseNumber)
+}
+
 func entranceLookup(db *leveldb.DB, way *osmpbf.Way, street string, housenumber string, context *context) (location Point, entranceType string) {
      var foundLocation Point
      eType := ""
@@ -832,6 +857,10 @@ func formatWay(way *osmpbf.Way, context *context) (id string, val []byte, jway *
         expandBBox(&p, &bboxmin, &bboxmax)
     }
 
+    if context.buildingOuterWays[way.ID] {
+        context.outerWayNodes[way.ID] = way.NodeIDs
+    }
+
     var centroid Point
     var centroidType string
     if isBuilding || hasAddress {
@@ -919,7 +948,20 @@ func formatRelation(relation *osmpbf.Relation, context *context) *jsonWayRel {
                         points = append(points, way.Centroid)
                	    }
                 } else {
-                    points = append(points, way.Centroid)
+                    // outer ways of building multipolygons have no tags of their own,
+                    // so look for the entrances using the address of the relation
+                    entranceFound := false
+                    if nodeIDs, ok := context.outerWayNodes[each.ID]; ok && isOuterRole(each.Role) && isBuildingMultipolygon(relation.Tags) {
+                        outer := &osmpbf.Way{ID: each.ID, NodeIDs: nodeIDs}
+                        if val, cType := entranceLookup(context.nodes, outer, street, houseNumber, context); cType != "" && (centroidType == "" || cType == "mainEntrance") {
+                            centroid = val
+                            centroidType = cType
+                            entranceFound = true
+                        }
+                    }
+                    if !entranceFound {
+                        points = append(points, way.Centroid)
+                    }
                 }
                 if !bbox_init {
                     bboxmin = way.BBoxMin
